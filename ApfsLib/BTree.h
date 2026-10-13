@@ -97,8 +97,8 @@ protected:
 	std::vector<uint8_t> m_block;
 	BTree &m_tree;
 
-	uint16_t m_keys_start; // Up
-	uint16_t m_vals_start; // Dn
+	size_t m_keys_start; // Up
+	size_t m_vals_start; // Dn
 
 	const uint32_t m_parent_index;
 	const std::shared_ptr<BTreeNode> m_parent;
@@ -174,7 +174,7 @@ private:
 	std::shared_ptr<BTreeNode> m_root_node;
 	ApfsNodeMapper *m_omap;
 
-	btree_info_t m_treeinfo;
+	btree_info_t m_treeinfo{};
 
 	oid_t m_oid;
 	xid_t m_xid;

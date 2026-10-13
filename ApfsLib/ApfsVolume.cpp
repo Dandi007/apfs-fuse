@@ -94,8 +94,10 @@ bool ApfsVolume::Init(paddr_t apsb_paddr)
 		m_is_encrypted = true;
 	}
 
-	if (!m_fs_tree.Init(m_sb.apfs_root_tree_oid, m_sb.apfs_o.o_xid, &m_omap))
+	if (!m_fs_tree.Init(m_sb.apfs_root_tree_oid, m_sb.apfs_o.o_xid, &m_omap)) {
 		std::cerr << "ERROR: root tree init failed" << std::endl;
+		return false;
+	}
 
 	if (!m_extentref_tree.Init(m_sb.apfs_extentref_tree_oid, m_sb.apfs_o.o_xid))
 		std::cerr << "WARNING: extentref tree init failed" << std::endl;
@@ -196,8 +198,10 @@ bool ApfsVolume::MountSnapshot(paddr_t apsb_paddr, xid_t snap_xid)
 		m_is_encrypted = true;
 	}
 
-	if (!m_fs_tree.Init(m_sb.apfs_root_tree_oid, m_sb.apfs_o.o_xid, &m_omap))
-		std::cerr << "WARNING: root tree init failed" << std::endl;
+	if (!m_fs_tree.Init(m_sb.apfs_root_tree_oid, m_sb.apfs_o.o_xid, &m_omap)) {
+		std::cerr << "ERROR: root tree init failed" << std::endl;
+		return false;
+	}
 
 	if (!m_extentref_tree.Init(m_sb.apfs_extentref_tree_oid, m_sb.apfs_o.o_xid))
 		std::cerr << "WARNING: extentref tree init failed" << std::endl;

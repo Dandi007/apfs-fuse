@@ -270,6 +270,7 @@ bool BTree::Lookup(BTreeEntry &result, const void *key, size_t key_size, BTCompa
 
 bool BTree::GetIterator(BTreeIterator& it, const void* key, size_t key_size, BTCompareFunc func, void *context)
 {
+	if (!m_root_node) return false;
 	oid_t oid;
 	int index;
 
@@ -297,6 +298,7 @@ bool BTree::GetIterator(BTreeIterator& it, const void* key, size_t key_size, BTC
 		}
 
 		node = GetNode(oid, node, index);
+		if (!node) return false;
 	}
 
 	index = FindBin(node, key, key_size, func, context, FindMode::GE);
@@ -329,6 +331,7 @@ bool BTree::GetIterator(BTreeIterator& it, const void* key, size_t key_size, BTC
 
 bool BTree::GetIteratorBegin(BTreeIterator& it)
 {
+	if (!m_root_node) return false;
 	oid_t oid;
 
 	std::shared_ptr<BTreeNode> node(m_root_node);
@@ -346,6 +349,7 @@ bool BTree::GetIteratorBegin(BTreeIterator& it)
 			oid = *reinterpret_cast<const oid_t *>(e.val);
 		}
 		node = GetNode(oid, node, 0);
+		if (!node) return false;
 	}
 
 	it.Setup(this, node, 0);

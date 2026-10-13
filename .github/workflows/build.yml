@@ -1,0 +1,18 @@
+name: build-and-test
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        build_type: [Debug, Release]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: sudo apt-get update && sudo apt-get install -y libfuse3-dev zlib1g-dev libbz2-dev
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+      - run: cmake --build build -j2
+      - run: ctest --test-dir build --output-on-failure
