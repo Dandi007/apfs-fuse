@@ -378,6 +378,9 @@ static void apfs_lookup(fuse_req_t req, fuse_ino_t ino, const char *name)
 	{
 		fuse_entry_param e;
 
+		// Zero generation: the kernel treats a changed generation as a reused
+		// nodeid and replaces the inode, breaking bind mounts that hold it.
+		memset(&e, 0, sizeof(e));
 		e.ino = res.file_id;
 		e.attr_timeout = FUSE_TIMEOUT;
 		e.entry_timeout = FUSE_TIMEOUT;
@@ -387,7 +390,10 @@ static void apfs_lookup(fuse_req_t req, fuse_ino_t ino, const char *name)
 		if (g_debug & Dbg_Info)
 			std::cout << "    apfs_stat_internal " << res.file_id << " => " << (rc ? "OK" : "FAIL") << std::endl;
 
-		fuse_reply_entry(req, &e);
+		if (rc)
+			fuse_reply_entry(req, &e);
+		else
+			fuse_reply_err(req, EIO);
 	}
 }
 
