@@ -22,7 +22,7 @@
 
 ## 验收
 
-`tests/lookup-generation.sh`（CTest `lookup-generation`）流程：用 `mkapfs` 生成 64 MiB 镜像并以 apfs-fuse 只读挂载；每次 stat `root` 前清 dentry cache，共 4 次；用 strace 截取 `/dev/fuse` 上的 `fuse_entry_out`，断言至少 3 次 lookup 且 generation 全为 0。缺少 mkapfs、strace 或无密码 sudo 时返回 77（跳过）；CI 设置 `LOOKUP_TEST_REQUIRED=1`，缺依赖直接失败。
+`tests/lookup-generation.sh`（CTest `lookup-generation`）流程：用 `mkapfs` 生成 1 GiB 稀疏镜像（noble 版 mkapfs 不支持过小容器）并以 apfs-fuse 只读挂载；每次 stat `root` 前清 dentry cache，共 4 次；用 strace 截取 `/dev/fuse` 上的 `fuse_entry_out`，断言至少 3 次 lookup 且 generation 全为 0。缺少 mkapfs、strace 或无密码 sudo 时返回 77（跳过）；CI 设置 `LOOKUP_TEST_REQUIRED=1`，缺依赖直接失败。
 
 - 修复版 Debug 与 Release 构建，两个 CTest 均通过。
 - 对 94dec36 运行同一脚本失败：generation 从第 2 次 lookup 起为非零残留值。

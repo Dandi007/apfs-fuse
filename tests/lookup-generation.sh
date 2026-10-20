@@ -12,7 +12,7 @@ if [ -z "$MKAPFS" ] || ! command -v strace >/dev/null || ! sudo -n true 2>/dev/n
 fi
 dir=$(mktemp -d)
 trap 'sudo -n umount "$dir/m" 2>/dev/null || true; sudo -n rm -rf "$dir"' EXIT
-truncate -s 64M "$dir/img"
+truncate -s 1G "$dir/img"
 "$MKAPFS" "$dir/img" >/dev/null
 mkdir "$dir/m"
 sudo -n strace -f -xx -s 256 -e trace=writev -o "$dir/log" "$FUSE" -o ro "$dir/img" "$dir/m" &
