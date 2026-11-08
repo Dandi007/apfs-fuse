@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""FUSE-level assertions over the synthetic APFS fixtures (T2)."""
+
+import ctypes
+import errno
+import os
+import subprocess
+import sys
+import time
+
+BIN = sys.argv[1]
+WORK = sys.argv[2]
+FUSERMOUNT = sys.argv[3]
+MNT = os.path.join(WORK, "mnt")
+
+USE_SUDO = os.environ.get("APFS_FUSE_USE_SUDO") == "1"
+PREFIX = ["sudo", "-n"] if USE_SUDO else []
+
+DECMPFS = "com.apple.decmpfs"
+RF = "com.apple.ResourceFork"
+
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+
+
+def fail(message):
+    print("FAIL:", message)
+    sys.exit(1)
+
+
+def mount(image, extra=()):
+    args = [BIN]
+    options = []
+    if extra:
+        options.append(extra)
+    if options:
+        args.extend(["-o", ",".join(options)])
+    args.extend([image, MNT])
+    subprocess.run(PREFIX + args, check=True)
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        try:
+            os.listdir(MNT)
+            return
+        except OSError:
+            time.sleep(0.05)
+    fail("mount did not become ready: " + image)
+
+
+def unmount():
+    subprocess.run(PREFIX + [FUSERMOUNT, "-u", MNT], check=False,
+                   stderr=subprocess.DEVNULL)
+    time.sleep(0.1)
+    if os.path.ismount(MNT):
+        # Restricted containers sometimes refuse a regular FUSE unmount even
+        # for root; a lazy unmount is enough for a throwaway mount point.
+        subprocess.run(PREFIX + ["umount", "-l", MNT], check=False,
+                   stderr=subprocess.DEVNULL)
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if not os.path.ismount(MNT):
+            return
+        time.sleep(0.05)
+    fail("unmount did not complete")
+
+
+def xattrs(path):
+    return set(os.listxattr(path))
+
+
+def lgetxattr(path, name, size):
+    buf = ctypes.create_string_buffer(size) if size else None
+    res = libc.lgetxattr(path.encode(), name.encode(), buf, size)
+    if res < 0:
+        err = ctypes.get_errno()
+        return -1, err, None
+    return res, 0, buf.raw[:res]
+
+
+def expect_errno(call, expected, message):
+    try:
+        call()
+    except OSError as exc:
+        if exc.errno != expected:
+            fail("%s: got errno %d, expected %d" % (message, exc.errno, expected))
+        return
+    fail("%s: call unexpectedly succeeded" % message)
+
+
+def test_good_default():
+    mount(os.path.join(WORK, "good.img"))
+    root = os.path.join(MNT, "root")
+
+    names = sorted(os.listdir(root))
+    for expected in ("inline", "rf", "user-rf", "xattrs", "hole.bin", "gap.bin"):
+        if expected not in names:
+            fail("default view is missing " + expected)
+
+    # Default (non-backup) view keeps the on-disk compression metadata visible.
+    if DECMPFS not in xattrs(os.path.join(root, "inline")):
+        fail("default view must expose decmpfs on inline files")
+
+    # Damaged compression metadata must not make the object unreachable: the
+    # backup manifest still needs type/mode/size.
+    st = os.stat(os.path.join(root, "inline-empty"))
+    if st.st_size != 0:
+        fail("inline-empty default size changed: %d" % st.st_size)
+    st = os.stat(os.path.join(root, "size-mismatch"))
+    if st.st_size != 99:
+        fail("size-mismatch default size changed: %d" % st.st_size)
+
+    # A missing name is ENOENT, not EIO.
+    expect_errno(lambda: os.stat(os.path.join(root, "no-such-name")), errno.ENOENT,
+                 "missing name")
+
+    # A missing extent record must be EIO, not silent zero-fill.
+    fd = os.open(os.path.join(root, "gap.bin"), os.O_RDONLY)
+    try:
+        expect_errno(lambda: os.read(fd, 80), errno.EIO, "missing extent record")
+    finally:
+        os.close(fd)
+
+    # Explicit hole: zeros in the middle, real data on both sides.
+    with open(os.path.join(root, "hole.bin"), "rb") as f:
+        data = f.read()
+    if len(data) != 80:
+        fail("hole.bin size is %d" % len(data))
+    if data[:24] != bytes(k & 0xFF for k in range(24)):
+        fail("hole.bin prefix data")
+    if data[24:64] != bytes(40):
+        fail("hole.bin explicit hole is not zero")
+    if data[64:80] != bytes(k & 0xFF for k in range(64, 80)):
+        fail("hole.bin suffix data")
+
+    # xattr semantics at the FUSE boundary.
+    path = os.path.join(root, "xattrs")
+    if os.getxattr(path, "com.apple.test.small") != b"hello":
+        fail("small xattr value")
+    big = os.getxattr(path, "com.apple.test.big64k")
+    if len(big) != 65536:
+        fail("64 KiB xattr length")
+    expect_errno(lambda: os.getxattr(path, "com.apple.test.big64k1"), errno.EIO,
+                 "65537-byte xattr must be EIO")
+    res, err, _ = lgetxattr(path, "com.apple.test.small", 4)
+    if res != -1 or err != errno.ERANGE:
+        fail("short xattr buffer must be ERANGE (res=%d err=%d)" % (res, err))
+
+    unmount()
+
+
+def test_good_backup():
+    mount(os.path.join(WORK, "good.img"), "backup_view=1")
+    root = os.path.join(MNT, "root")
+
+    inline = xattrs(os.path.join(root, "inline"))
+    if DECMPFS in inline:
+        fail("backup view must hide decmpfs for inline compression")
+
+    rf = xattrs(os.path.join(root, "rf"))
+    if DECMPFS in rf or RF in rf:
+        fail("backup view must hide the decmpfs/RF carrier pair")
+
+    if RF not in xattrs(os.path.join(root, "user-rf")):
+        fail("backup view must keep a real user resource fork")
+
+    inline_rf = xattrs(os.path.join(root, "inline-user-rf"))
+    if DECMPFS in inline_rf:
+        fail("backup view hides decmpfs on inline files")
+    if RF not in inline_rf:
+        fail("backup view must keep the user RF on inline files")
+
+    expect_errno(
+        lambda: os.getxattr(os.path.join(root, "inline-empty"), DECMPFS),
+        errno.EIO, "broken compression metadata in backup view")
+    expect_errno(
+        lambda: os.getxattr(os.path.join(root, "rf-missing"), RF),
+        errno.EIO, "missing RF carrier in backup view")
+
+    # The default view is the oracle for stat semantics: backup_view must not
+    # change sizes for reachable objects.
+    st = os.stat(os.path.join(root, "inline"))
+    if st.st_size != 100:
+        fail("inline size in backup view: %d" % st.st_size)
+
+    unmount()
+
+
+def test_bad():
+    mount(os.path.join(WORK, "bad.img"))
+    root = os.path.join(MNT, "root")
+
+    expect_errno(lambda: os.stat(os.path.join(root, "badfile")), errno.EIO,
+                 "damaged leaf lookup")
+    expect_errno(lambda: os.stat(os.path.join(root, "no-such-name")), errno.ENOENT,
+                 "missing name next to damaged pages")
+
+    unmount()
+
+
+def main():
+    test_good_default()
+    test_good_backup()
+    test_bad()
+    print("FUSE reader tests passed")
+
+
+if __name__ == "__main__":
+    main()

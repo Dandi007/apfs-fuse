@@ -164,6 +164,21 @@ if (BUILD_TESTING)
   target_link_libraries(reader-policy-test apfs)
   add_test(NAME reader-policy COMMAND reader-policy-test)
 
+  add_library(apfs-fixture STATIC tests/ApfsFixture.cpp tests/ApfsFixture.h)
+  target_link_libraries(apfs-fixture apfs)
+
+  add_executable(reader-integration-test tests/ApfsReaderIntegrationTest.cpp)
+  target_link_libraries(reader-integration-test apfs apfs-fixture)
+  add_test(NAME reader-integration COMMAND reader-integration-test)
+  set_tests_properties(reader-integration PROPERTIES SKIP_RETURN_CODE 77)
+
+  add_executable(apfs-fixture-gen tests/ApfsFixtureGen.cpp)
+  target_link_libraries(apfs-fixture-gen apfs-fixture)
+
+  add_test(NAME reader-fuse COMMAND sh ${CMAKE_SOURCE_DIR}/tests/reader-fuse.sh
+    $<TARGET_FILE:apfs-fuse> $<TARGET_FILE:apfs-fixture-gen>)
+  set_tests_properties(reader-fuse PROPERTIES SKIP_RETURN_CODE 77)
+
   add_test(NAME lookup-generation COMMAND sh ${CMAKE_SOURCE_DIR}/tests/lookup-generation.sh $<TARGET_FILE:apfs-fuse>)
   set_tests_properties(lookup-generation PROPERTIES SKIP_RETURN_CODE 77)
 endif()
