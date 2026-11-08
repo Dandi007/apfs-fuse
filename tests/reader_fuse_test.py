@@ -33,6 +33,18 @@ RF_GOLDEN = {
         "39df88537b4c33765f79d63e1d6ce4f09b65cae0758667658da2169b94fde121"),
 }
 
+# Valid inline zlib (algo 3) content. Unlike RF_GOLDEN these files have no
+# ResourceFork carrier: the whole zlib stream lives in the decmpfs xattr.
+INLINE_ZLIB_GOLDEN = {
+    "inline-zlib": (16384,
+        "8bb2b1c190c37e098a55be7bb5076a78e5b27712bea936fe5163fa5b70493918"),
+}
+
+# Damaged inline zlib fixtures. Both keep a valid zlib header, so the reader
+# must enter DecompressZLib() and fail closed instead of hanging or returning
+# partial data. In the default (strict, non `-l`) mode open() is EIO.
+DAMAGED_ZLIB = ("inline-zlib-truncated", "inline-zlib-corrupt")
+
 libc = ctypes.CDLL("libc.so.6", use_errno=True)
 
 
@@ -137,6 +149,35 @@ def check_rf_content(root, backup):
             fail("%s content SHA-256 mismatch" % name)
 
 
+def check_inline_zlib(root, backup):
+    for name in sorted(INLINE_ZLIB_GOLDEN):
+        size, digest = INLINE_ZLIB_GOLDEN[name]
+        path = os.path.join(root, name)
+        attrs = xattrs(path)
+        if backup:
+            if DECMPFS in attrs:
+                fail("backup view must hide decmpfs on " + name)
+        else:
+            if DECMPFS not in attrs:
+                fail("default view must expose decmpfs on " + name)
+            if RF in attrs:
+                fail("inline zlib must not expose a ResourceFork carrier: " + name)
+        st = os.stat(path)
+        if st.st_size != size:
+            fail("%s size is %d, expected %d" % (name, st.st_size, size))
+        with open(path, "rb") as f:
+            data = f.read()
+        if hashlib.sha256(data).hexdigest() != digest:
+            fail("%s content SHA-256 mismatch" % name)
+
+
+def expect_damaged_zlib_eio(root):
+    for name in DAMAGED_ZLIB:
+        expect_errno(
+            lambda name=name: os.open(os.path.join(root, name), os.O_RDONLY),
+            errno.EIO, name + " open")
+
+
 def test_good_default():
     mount(os.path.join(WORK, "good.img"))
     root = os.path.join(MNT, "root")
@@ -201,6 +242,11 @@ def test_good_default():
     # Valid resource-fork compressed content must decompress in the default view.
     check_rf_content(root, backup=False)
 
+    # Inline zlib (algo 3) content and its damaged variants. Both damaged
+    # fixtures must be EIO under the default strict mode, never partial data.
+    check_inline_zlib(root, backup=False)
+    expect_damaged_zlib_eio(root)
+
     # The original placeholder keeps its invalid carrier: opening it is EIO.
     expect_errno(lambda: open(os.path.join(root, "rf"), "rb"), errno.EIO,
                  "invalid RF carrier open")
@@ -244,6 +290,7 @@ def test_good_backup():
 
     # backup_view=1 hides the metadata pair but still returns the real content.
     check_rf_content(root, backup=True)
+    check_inline_zlib(root, backup=True)
 
     unmount()
 
@@ -264,12 +311,27 @@ def test_foreground_log():
     mount(os.path.join(WORK, "good.img"), foreground=True)
     try:
         os.stat(os.path.join(MNT, "root", "unicode-\U0001f9e8"))
+        # These opens must reach DecompressZLib() and fail closed; the FUSE
+        # process writes the diagnostic to the captured foreground log.
+        expect_damaged_zlib_eio(os.path.join(MNT, "root"))
     finally:
         unmount()
     with open(os.path.join(WORK, "foreground.log"), "rb") as log:
         data = log.read()
     if b"APFS_UNICODE_FALLBACK" not in data or b"name_hex=756e69636f64652df09fa7a8" not in data:
         fail("foreground fallback log missing")
+
+    zlib_lines = [line for line in data.splitlines() if b"APFS_ZLIB_ERROR" in line]
+    if len(zlib_lines) < len(DAMAGED_ZLIB):
+        fail("foreground log is missing damaged-zlib diagnostics")
+    for line in zlib_lines:
+        for field in (b"ret=", b"total_in=", b"total_out=", b"src_size=", b"dst_size="):
+            if field not in line:
+                fail("zlib diagnostic is missing %s: %r" % (field.decode(), line))
+        # The diagnostic describes the stream only. A real path or the image
+        # name would leak where the backup source lives.
+        if WORK.encode() in line or b"good.img" in line:
+            fail("zlib diagnostic leaks the image path: %r" % line)
 
 
 def main():
