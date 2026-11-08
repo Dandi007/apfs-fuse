@@ -62,6 +62,7 @@ enum class CompressionClass
 	InvalidHeader,
 	UnsupportedAlgorithm,
 	MissingCarrier,
+	TooLarge,
 	IoError
 };
 
@@ -73,11 +74,15 @@ struct CompressionMeta
 	bool header_valid;
 	uint32_t algo;
 	uint64_t uncompressed_size;
+	uint64_t decmpfs_attr_size;
+	bool has_inode_uncompressed_size;
+	uint64_t inode_uncompressed_size;
 	bool resource_fork_io_error;
 	bool resource_fork_found;
 };
 
-CompressionClass ClassifyCompression(const CompressionMeta &meta);
+// "max_uncompressed_size" is a configurable RSS gate. Zero means no limit.
+CompressionClass ClassifyCompression(const CompressionMeta &meta, uint64_t max_uncompressed_size = 0);
 
 // Backup-view visibility rules. A valid inline compression header hides only
 // com.apple.decmpfs. A valid resource-fork algorithm hides decmpfs and its

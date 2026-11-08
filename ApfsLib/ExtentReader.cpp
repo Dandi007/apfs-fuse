@@ -32,7 +32,7 @@ namespace
 }
 
 IoStatus ReadFileInternal(ExtentSource &source, void *data, uint64_t ino,
-	uint64_t offs, size_t size, uint64_t file_size, bool sparse_allowed)
+	uint64_t offs, size_t size, uint64_t file_size)
 {
 	if (size == 0)
 		return IoStatus::Ok;
@@ -48,7 +48,6 @@ IoStatus ReadFileInternal(ExtentSource &source, void *data, uint64_t ino,
 			size = static_cast<size_t>(file_size - offs);
 	}
 
-	const uint64_t request_end = offs + static_cast<uint64_t>(size);
 	const uint32_t block_size = source.BlockSize();
 	if (!IsPowerOfTwo(block_size))
 		return IoStatus::IoError;
@@ -62,39 +61,15 @@ IoStatus ReadFileInternal(ExtentSource &source, void *data, uint64_t ino,
 		ExtentInfo extent;
 		const IoStatus lookup = source.LookupExtent(ino, offs, extent);
 
-		if (lookup == IoStatus::IoError)
-			return IoStatus::IoError;
-
 		if (lookup == IoStatus::NotFound)
 		{
-			// No extent starts at or before this offset. This is either a
-			// leading hole or a hole after the last extent.
-			if (!sparse_allowed)
-				return IoStatus::IoError;
-
-			bool next_found = false;
-			uint64_t next_start = 0;
-			const IoStatus next = source.NextExtentStart(ino, offs, next_found, next_start);
-			if (next == IoStatus::IoError)
-				return IoStatus::IoError;
-
-			if (next_found && next_start <= offs)
-				return IoStatus::IoError;
-			if (!next_found && file_size == UINT64_MAX)
-				return IoStatus::IoError;
-
-			uint64_t bound = next_found ? next_start : file_size;
-			bound = std::min(bound, request_end);
-			if (bound <= offs)
-				return IoStatus::IoError;
-
-			const uint64_t hole = bound - offs;
-			std::memset(out, 0, static_cast<size_t>(hole));
-			out += hole;
-			offs += hole;
-			size -= static_cast<size_t>(hole);
-			continue;
+			// APFS represents a hole with an explicit extent length and
+			// phys_block == 0. A missing record is a damaged/incomplete tree,
+			// not a hole; zero-filling here would silently corrupt a backup.
+			return IoStatus::IoError;
 		}
+		if (lookup != IoStatus::Ok)
+			return IoStatus::IoError;
 
 		if (extent.length == 0)
 			return IoStatus::IoError;
@@ -105,50 +80,18 @@ IoStatus ReadFileInternal(ExtentSource &source, void *data, uint64_t ino,
 
 		if (offs < extent.logical_addr)
 		{
-			// The tree returned an extent after the requested offset. Treat
-			// the gap as a hole only when sparse reads are allowed; never let
-			// the subtraction underflow.
-			if (!sparse_allowed)
-				return IoStatus::IoError;
-
-			uint64_t hole = extent.logical_addr - offs;
-			hole = std::min<uint64_t>(hole, size);
-			std::memset(out, 0, static_cast<size_t>(hole));
-			out += hole;
-			offs += hole;
-			size -= static_cast<size_t>(hole);
-			continue;
+			// The record after the requested offset means the record that
+			// should cover it is missing. Never let the subtraction underflow
+			// and never turn this into a hole.
+			return IoStatus::IoError;
 		}
 
 		if (offs >= extent_end)
 		{
-			// The last extent starts before the request but does not cover
-			// it. This is a hole between extents (or a sparse tail).
-			if (!sparse_allowed)
-				return IoStatus::IoError;
-
-			bool next_found = false;
-			uint64_t next_start = 0;
-			const IoStatus next = source.NextExtentStart(ino, offs, next_found, next_start);
-			if (next == IoStatus::IoError)
-				return IoStatus::IoError;
-
-			if (next_found && next_start <= offs)
-				return IoStatus::IoError;
-			if (!next_found && file_size == UINT64_MAX)
-				return IoStatus::IoError;
-
-			uint64_t bound = next_found ? next_start : file_size;
-			bound = std::min(bound, request_end);
-			if (bound <= offs)
-				return IoStatus::IoError;
-
-			const uint64_t hole = bound - offs;
-			std::memset(out, 0, static_cast<size_t>(hole));
-			out += hole;
-			offs += hole;
-			size -= static_cast<size_t>(hole);
-			continue;
+			// The last record starts before the request but does not cover it.
+			// Tail holes after the last record are fail-closed until a trusted
+			// fixture proves that macOS emits such a layout.
+			return IoStatus::IoError;
 		}
 
 		const uint64_t within = offs - extent.logical_addr;

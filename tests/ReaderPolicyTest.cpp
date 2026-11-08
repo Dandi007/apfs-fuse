@@ -93,15 +93,34 @@ static void test_compression_classification()
 	meta.decmpfs_found = true;
 	meta.header_valid = true;
 	meta.algo = 9; // uncompressed, inline
+	meta.decmpfs_attr_size = 17; // header plus payload
 	require(ClassifyCompression(meta) == CompressionClass::InlineAttr, "inline algorithm");
 	require(HidesDecmpfs(CompressionClass::InlineAttr), "inline hides decmpfs");
 	require(!HidesResourceFork(CompressionClass::InlineAttr), "inline keeps real user RF");
+
+	meta.decmpfs_attr_size = sizeof(CompressionHeader);
+	require(ClassifyCompression(meta) == CompressionClass::InvalidHeader,
+		"inline algorithm without a payload is invalid");
+
+	meta.decmpfs_attr_size = 17;
+	meta.has_inode_uncompressed_size = true;
+	meta.inode_uncompressed_size = 101;
+	meta.uncompressed_size = 100;
+	require(ClassifyCompression(meta) == CompressionClass::InvalidHeader,
+		"inode size must match the header size");
+
+	meta.inode_uncompressed_size = 100;
+	require(ClassifyCompression(meta) == CompressionClass::InlineAttr,
+		"matching inode size is accepted");
+	require(ClassifyCompression(meta, 50) == CompressionClass::TooLarge,
+		"configured decompression limit");
 
 	meta = {};
 	meta.compressed_flag = true;
 	meta.decmpfs_found = true;
 	meta.header_valid = true;
 	meta.algo = 4; // zlib, resource fork
+	meta.decmpfs_attr_size = sizeof(CompressionHeader);
 	require(ClassifyCompression(meta) == CompressionClass::MissingCarrier, "missing RF carrier");
 
 	meta.resource_fork_found = true;
@@ -117,6 +136,7 @@ static void test_compression_classification()
 	require(CompressionClassIsError(CompressionClass::InvalidHeader), "invalid header is an error");
 	require(CompressionClassIsError(CompressionClass::UnsupportedAlgorithm), "unknown algo is an error");
 	require(CompressionClassIsError(CompressionClass::MissingCarrier), "missing carrier is an error");
+	require(CompressionClassIsError(CompressionClass::TooLarge), "oversize decompression is an error");
 	require(CompressionClassIsError(CompressionClass::IoError), "I/O failure is an error");
 	require(!CompressionClassIsError(CompressionClass::InlineAttr), "inline is not an error");
 	require(!CompressionClassIsError(CompressionClass::ResourceFork), "RF is not an error");

@@ -74,6 +74,8 @@ add_library(apfs
 	ApfsLib/BTree.h
 	ApfsLib/CheckPointMap.cpp
 	ApfsLib/CheckPointMap.h
+	ApfsLib/CompressionView.cpp
+	ApfsLib/CompressionView.h
 	ApfsLib/Crc32.cpp
 	ApfsLib/Crc32.h
 	ApfsLib/Decmpfs.cpp

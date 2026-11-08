@@ -41,13 +41,10 @@ public:
 	virtual ~ExtentSource() {}
 
 	// Returns the extent covering logical offset "offs", or the last extent
-	// starting at or before it. IoStatus::NotFound is a normal answer (the
-	// offset is in a hole); IoStatus::IoError means the tree or device failed.
+	// starting at or before it. IoStatus::NotFound is an error: APFS represents
+	// a hole with an explicit length and phys_block == 0, not with a missing
+	// record. IoStatus::IoError means the tree or device failed.
 	virtual IoStatus LookupExtent(uint64_t ino, uint64_t offs, ExtentInfo &extent) = 0;
-
-	// Finds the first extent starting at or after "offs". NotFound means there
-	// is no later extent for this inode.
-	virtual IoStatus NextExtentStart(uint64_t ino, uint64_t offs, bool &found, uint64_t &start) = 0;
 
 	// Reads blkcnt blocks. False includes short reads and device errors.
 	virtual bool ReadBlocks(void *data, uint64_t paddr, uint64_t blkcnt, uint64_t crypto_id) = 0;
@@ -58,8 +55,8 @@ public:
 // Reads [offs, offs + size) from an inode through an extent source.
 //
 // "file_size" clamps the request at EOF (pass UINT64_MAX if unknown).
-// "sparse_allowed" must only be set when the inode metadata proves that holes
-// are legitimate (sparse_bytes > 0 or allocated size < logical size). Without
-// it, a missing extent or a gap is an I/O/metadata error, never zero-fill.
+// A missing extent record, a gap between records or an extent starting after
+// the requested offset is an I/O/metadata error, never zero-fill. Only an
+// explicit phys_block == 0 extent is treated as a hole.
 IoStatus ReadFileInternal(ExtentSource &source, void *data, uint64_t ino,
-	uint64_t offs, size_t size, uint64_t file_size, bool sparse_allowed);
+	uint64_t offs, size_t size, uint64_t file_size);

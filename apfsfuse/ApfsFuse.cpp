@@ -46,6 +46,7 @@
 #include <ApfsLib/ApfsContainer.h>
 #include <ApfsLib/ApfsVolume.h>
 #include <ApfsLib/ApfsDir.h>
+#include <ApfsLib/CompressionView.h>
 #include <ApfsLib/Decmpfs.h>
 #include <ApfsLib/DeviceLinux.h>
 #include <ApfsLib/DeviceMac.h>
@@ -55,6 +56,8 @@
 #include <cassert>
 #include <cstring>
 #include <cstddef>
+#include <new>
+#include <stdexcept>
 
 #include <iostream>
 
@@ -77,6 +80,7 @@ static int g_physblksize = 512;
 static std::string g_password;
 static xid_t g_snap_xid = 0;
 static bool g_backup_view = false;
+static uint64_t g_max_decomp_size = 0;
 
 static const char *const DECMPFS_XATTR = "com.apple.decmpfs";
 static const char *const RESOURCE_FORK_XATTR = "com.apple.ResourceFork";
@@ -99,62 +103,6 @@ struct File
 	ApfsDir::Inode ino;
 	std::vector<uint8_t> decomp_data;
 };
-
-static CompressionClass ClassifyInodeCompression(ApfsDir &dir, const ApfsDir::Inode &rec,
-	uint64_t &uncompressed_size, uint64_t &decmpfs_attr_size)
-{
-	CompressionMeta meta = {};
-	bool has_rsrc_algo = false;
-
-	uncompressed_size = 0;
-	decmpfs_attr_size = 0;
-	meta.compressed_flag = (rec.bsd_flags & APFS_UF_COMPRESSED) != 0;
-
-	if (!meta.compressed_flag)
-		return CompressionClass::None;
-
-	std::vector<uint8_t> decmpfs;
-	IoStatus st = IoStatus::Ok;
-
-	if (!dir.GetAttribute(decmpfs, rec.obj_id, DECMPFS_XATTR, &st))
-	{
-		if (st == IoStatus::IoError)
-		{
-			meta.decmpfs_io_error = true;
-			return ClassifyCompression(meta);
-		}
-		meta.decmpfs_found = false;
-		return ClassifyCompression(meta);
-	}
-
-	meta.decmpfs_found = true;
-	decmpfs_attr_size = decmpfs.size();
-
-	DecmpfsHeader hdr = {};
-	if (ParseDecmpfsHeader(decmpfs.data(), decmpfs.size(), hdr))
-	{
-		meta.header_valid = true;
-		meta.algo = hdr.algo;
-		meta.uncompressed_size = hdr.uncompressed_size;
-		uncompressed_size = hdr.uncompressed_size;
-
-		has_rsrc_algo = hdr.algo <= 0xFFFF &&
-			IsDecompAlgoInRsrc(static_cast<uint16_t>(hdr.algo));
-	}
-
-	if (has_rsrc_algo)
-	{
-		ApfsDir::XAttr info;
-		IoStatus rst = IoStatus::Ok;
-
-		if (dir.GetAttributeInfo(info, rec.obj_id, RESOURCE_FORK_XATTR, &rst))
-			meta.resource_fork_found = true;
-		else if (rst == IoStatus::IoError)
-			meta.resource_fork_io_error = true;
-	}
-
-	return ClassifyCompression(meta);
-}
 
 static IoStatus apfs_stat_internal(fuse_ino_t ino, struct stat &st)
 {
@@ -206,26 +154,35 @@ static IoStatus apfs_stat_internal(fuse_ino_t ino, struct stat &st)
 			{
 				uint64_t uncompressed_size = 0;
 				uint64_t decmpfs_attr_size = 0;
-				const CompressionClass cls = ClassifyInodeCompression(dir, rec, uncompressed_size, decmpfs_attr_size);
+				const CompressionClass cls = ClassifyInodeCompression(dir, rec, uncompressed_size, decmpfs_attr_size, g_max_decomp_size);
 
-				if (CompressionClassIsError(cls))
-				{
-					if (!g_lax)
-						return IoStatus::IoError;
-
-					st.st_size = (cls == CompressionClass::UnsupportedAlgorithm) ? decmpfs_attr_size : 0;
-				}
-				else if (rec.internal_flags & INODE_HAS_UNCOMPRESSED_SIZE)
+				// Keep getattr reachable when the compression metadata is
+				// invalid: the backup manifest still needs type/mode/mtime.
+				// Blocking happens at open/read and in the backup-view xattr
+				// operations, not here.
+				if (rec.internal_flags & INODE_HAS_UNCOMPRESSED_SIZE)
 				{
 					st.st_size = rec.uncompressed_size;
 				}
-				else
+				else if (cls == CompressionClass::InlineAttr || cls == CompressionClass::ResourceFork)
 				{
 					st.st_size = uncompressed_size;
 					// st.st_blocks = data.size() / 512;
 					if (g_debug & Dbg_Cmpfs)
 						std::cout << "Compressed size " << uncompressed_size << " bytes." << std::endl;
 				}
+				else if (cls == CompressionClass::UnsupportedAlgorithm)
+				{
+					st.st_size = decmpfs_attr_size;
+				}
+				else
+				{
+					st.st_size = 0;
+				}
+
+				if (CompressionClassIsError(cls))
+					std::cerr << "Warning: compression metadata for inode " << ino
+						<< " is not usable (class " << static_cast<int>(cls) << ")" << std::endl;
 			}
 			else if (rec.optional_present_flags & ApfsDir::Inode::INO_HAS_DSTREAM)
 			{
@@ -332,9 +289,29 @@ static IoStatus GetBackupViewClass(ApfsDir &dir, fuse_ino_t ino, CompressionClas
 
 	uint64_t uncompressed_size = 0;
 	uint64_t decmpfs_attr_size = 0;
-	cls = ClassifyInodeCompression(dir, rec, uncompressed_size, decmpfs_attr_size);
+	cls = ClassifyInodeCompression(dir, rec, uncompressed_size, decmpfs_attr_size, g_max_decomp_size);
 
 	return CompressionClassIsError(cls) ? IoStatus::IoError : IoStatus::Ok;
+}
+
+static IoStatus GetXattrValueSize(ApfsDir &dir, uint64_t ino, const char *name, uint64_t &value_size)
+{
+	ApfsDir::XAttr info;
+	IoStatus status = IoStatus::Ok;
+
+	value_size = 0;
+
+	if (!dir.GetAttributeInfo(info, ino, name, &status))
+		return status;
+
+	if (info.flags & XATTR_DATA_STREAM)
+		value_size = info.xstrm.dstream.size;
+	else if (info.flags & XATTR_DATA_EMBEDDED)
+		value_size = info.xdata_len;
+	else
+		return IoStatus::IoError;
+
+	return IoStatus::Ok;
 }
 
 #ifdef __APPLE__
@@ -343,6 +320,7 @@ static void apfs_getxattr_mac(fuse_req_t req, fuse_ino_t ino, const char *name, 
 	ApfsDir dir(*g_volume);
 	std::vector<uint8_t> data;
 	IoStatus status = IoStatus::Ok;
+	uint64_t value_size = 0;
 
 	if (g_debug & Dbg_Info)
 		std::cout << "apfs_getxattr: " << std::hex << ino << " " << name << " => ";
@@ -374,7 +352,8 @@ static void apfs_getxattr_mac(fuse_req_t req, fuse_ino_t ino, const char *name, 
 		}
 	}
 
-	if (!dir.GetAttribute(data, ino, name, &status))
+	status = GetXattrValueSize(dir, ino, name, value_size);
+	if (status != IoStatus::Ok)
 	{
 		if (g_debug & Dbg_Info)
 			std::cout << "FAIL" << std::endl;
@@ -382,23 +361,41 @@ static void apfs_getxattr_mac(fuse_req_t req, fuse_ino_t ino, const char *name, 
 		return;
 	}
 
-	if (g_debug & Dbg_Info)
-		std::cout << "OK" << std::endl;
-
-	if (position > data.size())
+	if (position > value_size)
 	{
 		fuse_reply_err(req, ERANGE);
 		return;
 	}
 
-	const size_t value_size = data.size() - position;
+	const uint64_t remaining = value_size - position;
 
 	if (size == 0)
-		fuse_reply_xattr(req, value_size);
-	else if (size < value_size)
+	{
+		fuse_reply_xattr(req, static_cast<size_t>(remaining));
+		return;
+	}
+	if (size < remaining)
+	{
 		fuse_reply_err(req, ERANGE);
-	else
-		fuse_reply_buf(req, reinterpret_cast<const char *>(data.data()) + position, value_size);
+		return;
+	}
+
+	if (!dir.GetAttribute(data, ino, name, &status))
+	{
+		fuse_reply_err(req, status == IoStatus::IoError ? EIO : ENODATA);
+		return;
+	}
+	if (data.size() != value_size)
+	{
+		fuse_reply_err(req, EIO);
+		return;
+	}
+
+	if (g_debug & Dbg_Info)
+		std::cout << "OK" << std::endl;
+
+	fuse_reply_buf(req, reinterpret_cast<const char *>(data.data()) + position,
+		static_cast<size_t>(remaining));
 }
 #endif
 #ifdef __linux__
@@ -407,6 +404,7 @@ static void apfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, size
 	ApfsDir dir(*g_volume);
 	std::vector<uint8_t> data;
 	IoStatus status = IoStatus::Ok;
+	uint64_t value_size = 0;
 
 	if (g_debug & Dbg_Info)
 		std::cout << "apfs_getxattr: " << std::hex << ino << " " << name << " => ";
@@ -438,7 +436,11 @@ static void apfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, size
 		}
 	}
 
-	if (!dir.GetAttribute(data, ino, name, &status))
+	// Determine the logical value size from metadata first. This avoids
+	// reading a large resource fork just to answer a size query or to reject
+	// an oversized value.
+	status = GetXattrValueSize(dir, ino, name, value_size);
+	if (status != IoStatus::Ok)
 	{
 		if (g_debug & Dbg_Info)
 			std::cout << "FAIL" << std::endl;
@@ -446,26 +448,38 @@ static void apfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, size
 		return;
 	}
 
-	if (g_debug & Dbg_Info)
-		std::cout << "OK" << std::endl;
-
-	switch (PlanXattrReply(data.size(), size))
+	switch (PlanXattrReply(static_cast<size_t>(value_size), size))
 	{
 	case XattrReply::Size:
-		fuse_reply_xattr(req, data.size());
-		break;
+		fuse_reply_xattr(req, static_cast<size_t>(value_size));
+		return;
 	case XattrReply::ERange:
 		fuse_reply_err(req, ERANGE);
-		break;
+		return;
 	case XattrReply::TooLarge:
 		// A value above the FUSE xattr limit cannot be returned without
 		// truncation. Report it instead of silently shortening the value.
 		fuse_reply_err(req, EIO);
-		break;
+		return;
 	case XattrReply::Value:
-		fuse_reply_buf(req, reinterpret_cast<const char *>(data.data()), data.size());
 		break;
 	}
+
+	if (!dir.GetAttribute(data, ino, name, &status))
+	{
+		fuse_reply_err(req, status == IoStatus::IoError ? EIO : ENODATA);
+		return;
+	}
+	if (data.size() != value_size)
+	{
+		fuse_reply_err(req, EIO);
+		return;
+	}
+
+	if (g_debug & Dbg_Info)
+		std::cout << "OK" << std::endl;
+
+	fuse_reply_buf(req, reinterpret_cast<const char *>(data.data()), data.size());
 }
 #endif
 
@@ -589,7 +603,7 @@ static void apfs_open(fuse_req_t req, fuse_ino_t ino, fuse_file_info *fi)
 			std::vector<uint8_t> attr;
 			uint64_t uncompressed_size = 0;
 			uint64_t decmpfs_attr_size = 0;
-			const CompressionClass cls = ClassifyInodeCompression(dir, f->ino, uncompressed_size, decmpfs_attr_size);
+			const CompressionClass cls = ClassifyInodeCompression(dir, f->ino, uncompressed_size, decmpfs_attr_size, g_max_decomp_size);
 
 			if (CompressionClassIsError(cls) && !g_lax)
 			{
@@ -610,7 +624,19 @@ static void apfs_open(fuse_req_t req, fuse_ino_t ino, fuse_file_info *fi)
 			}
 			else
 			{
-				rc = DecompressFile(dir, ino, f->decomp_data, attr);
+				try
+				{
+					rc = DecompressFile(dir, ino, f->decomp_data, attr);
+				}
+				catch (const std::bad_alloc &)
+				{
+					rc = false;
+				}
+				catch (const std::length_error &)
+				{
+					rc = false;
+				}
+
 				// In strict mode, do not return uncompressed data.
 				if (!rc && !g_lax)
 				{
@@ -672,14 +698,10 @@ static void apfs_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, st
 		if (want > eof - offs)
 			want = static_cast<size_t>(eof - offs);
 
-		bool sparse = false;
-		if (file->ino.optional_present_flags & ApfsDir::Inode::INO_HAS_SPARSE_BYTES)
-			sparse = file->ino.sparse_bytes > 0;
-
 		std::vector<char> buf(want);
 		IoStatus status = IoStatus::Ok;
 
-		if (!dir.ReadFile(buf.data(), file->ino.private_id, offs, want, &status, eof, sparse))
+		if (!dir.ReadFile(buf.data(), file->ino.private_id, offs, want, &status, eof))
 		{
 			fuse_reply_err(req, EIO);
 			return;
@@ -869,6 +891,8 @@ void usage(const char *name)
 	std::cout << "                for resource-fork algorithms, its com.apple.ResourceFork" << std::endl;
 	std::cout << "                carrier) from the xattr view. Real user resource forks are" << std::endl;
 	std::cout << "                kept. Default: off." << std::endl;
+	std::cout << "max_decomp_size=N : Reject compressed files whose header claims more than" << std::endl;
+	std::cout << "                N uncompressed bytes. 0 means no limit. Default: 0." << std::endl;
 	std::cout << std::endl;
 }
 
@@ -935,6 +959,16 @@ static int apfs_parse_fuse_opt(void *data, const char *arg, int key, struct fuse
 			}
 			std::cerr << "Invalid backup_view option: " << arg << std::endl;
 			return -1;
+		}
+		else if (!strncmp(arg, "max_decomp_size=", 16)) {
+			char *end = nullptr;
+			const unsigned long long value = strtoull(arg + 16, &end, 10);
+			if (end == arg + 16 || *end != '\0') {
+				std::cerr << "Invalid max_decomp_size option: " << arg << std::endl;
+				return -1;
+			}
+			g_max_decomp_size = value;
+			return 0;
 		}
 	}
 	return 1;

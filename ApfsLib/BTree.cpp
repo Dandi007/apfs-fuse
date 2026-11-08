@@ -785,12 +785,26 @@ std::shared_ptr<BTreeNode> BTreeIterator::next_node()
 		return std::shared_ptr<BTreeNode>();
 
 	while (node->level() > 0) {
-		node->GetEntry(e, pidx);
+		if (!node->GetEntry(e, pidx))
+		{
+			m_error = true;
+			return std::shared_ptr<BTreeNode>();
+		}
 
 		if (node->flags() & BTNODE_HASHED) {
+			if (e.val_len < sizeof(btn_index_node_val_t))
+			{
+				m_error = true;
+				return std::shared_ptr<BTreeNode>();
+			}
 			const btn_index_node_val_t *binv = reinterpret_cast<const btn_index_node_val_t *>(e.val);
 			oid = binv->binv_child_oid + m_tree->m_oid;
 		} else {
+			if (e.val_len != sizeof(uint64_t))
+			{
+				m_error = true;
+				return std::shared_ptr<BTreeNode>();
+			}
 			oid = *reinterpret_cast<const uint64_t *>(e.val);
 		}
 
@@ -803,6 +817,7 @@ std::shared_ptr<BTreeNode> BTreeIterator::next_node()
 		{
 			std::cerr << "Failed to load btree node oid " << oid << std::endl;
 			m_error = true;
+			return std::shared_ptr<BTreeNode>();
 		}
 
 		pidx = 0;

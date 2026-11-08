@@ -63,7 +63,7 @@ bool ParseDecmpfsHeader(const void *data, size_t size, DecmpfsHeader &header)
 	return header.signature == DECMPFS_MAGIC;
 }
 
-CompressionClass ClassifyCompression(const CompressionMeta &meta)
+CompressionClass ClassifyCompression(const CompressionMeta &meta, uint64_t max_uncompressed_size)
 {
 	if (!meta.compressed_flag)
 		return CompressionClass::None;
@@ -77,8 +77,23 @@ CompressionClass ClassifyCompression(const CompressionMeta &meta)
 	if (!meta.header_valid)
 		return CompressionClass::InvalidHeader;
 
+	if (meta.has_inode_uncompressed_size &&
+		meta.inode_uncompressed_size != meta.uncompressed_size)
+		return CompressionClass::InvalidHeader;
+
 	if (meta.algo > 0xFFFF || !IsDecompAlgoSupported(static_cast<uint16_t>(meta.algo)))
 		return CompressionClass::UnsupportedAlgorithm;
+
+	if (!IsDecompAlgoInRsrc(static_cast<uint16_t>(meta.algo)) &&
+		meta.decmpfs_attr_size <= sizeof(CompressionHeader))
+	{
+		// Inline algorithms must carry a compressed payload after the header.
+		// A header-only attribute would make decompression read past its end.
+		return CompressionClass::InvalidHeader;
+	}
+
+	if (max_uncompressed_size != 0 && meta.uncompressed_size > max_uncompressed_size)
+		return CompressionClass::TooLarge;
 
 	if (IsDecompAlgoInRsrc(static_cast<uint16_t>(meta.algo)))
 	{
@@ -111,6 +126,7 @@ bool CompressionClassIsError(CompressionClass cls)
 	case CompressionClass::InvalidHeader:
 	case CompressionClass::UnsupportedAlgorithm:
 	case CompressionClass::MissingCarrier:
+	case CompressionClass::TooLarge:
 	case CompressionClass::IoError:
 		return true;
 	default:

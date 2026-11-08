@@ -44,6 +44,15 @@ void strcpy_s(char (&dst)[L], const char *src)
 }
 #endif
 
+static void log_unicode_fallback(uint64_t parent_id, const char *name)
+{
+	std::cerr << "APFS_UNICODE_FALLBACK parent_id=" << parent_id << " name_hex=";
+	std::cerr << std::hex << std::setfill('0');
+	for (const unsigned char *p = reinterpret_cast<const unsigned char *>(name); *p; p++)
+		std::cerr << std::setw(2) << static_cast<unsigned int>(*p);
+	std::cerr << std::dec << std::endl;
+}
+
 ApfsDir::Inode::Inode()
 {
 	obj_id = 0;
@@ -261,73 +270,6 @@ public:
 		}
 
 		return IoStatus::Ok;
-	}
-
-	IoStatus NextExtentStart(uint64_t ino, uint64_t offs, bool &found, uint64_t &start) override
-	{
-		BTreeIterator it;
-		BTreeEntry e;
-
-		found = false;
-
-		if (m_dir.m_vol.isSealed())
-		{
-			fext_tree_key_t key;
-			key.private_id = ino;
-			key.logical_addr = offs;
-
-			if (!m_dir.m_vol.fexttree().GetIterator(it, &key, sizeof(key), CompareFextKey, &m_dir))
-				return IoStatus::IoError;
-
-			for (;;)
-			{
-				if (!it.GetEntry(e))
-					return it.HasError() ? IoStatus::IoError : IoStatus::Ok;
-				if (e.key_len < sizeof(fext_tree_key_t))
-					return IoStatus::IoError;
-
-				const fext_tree_key_t *k = reinterpret_cast<const fext_tree_key_t *>(e.key);
-				if (k->private_id != ino)
-					return IoStatus::Ok;
-				if (k->logical_addr >= offs)
-				{
-					start = k->logical_addr;
-					found = true;
-					return IoStatus::Ok;
-				}
-
-				if (!it.next())
-					return it.HasError() ? IoStatus::IoError : IoStatus::Ok;
-			}
-		}
-
-		j_file_extent_key_t key;
-		key.hdr.obj_id_and_type = APFS_TYPE_ID(APFS_TYPE_FILE_EXTENT, ino);
-		key.logical_addr = offs;
-
-		if (!m_dir.m_fs_tree.GetIterator(it, &key, sizeof(key), CompareStdDirKey, &m_dir))
-			return IoStatus::IoError;
-
-		for (;;)
-		{
-			if (!it.GetEntry(e))
-				return it.HasError() ? IoStatus::IoError : IoStatus::Ok;
-			if (e.key_len < sizeof(j_file_extent_key_t))
-				return IoStatus::IoError;
-
-			const j_file_extent_key_t *k = reinterpret_cast<const j_file_extent_key_t *>(e.key);
-			if (k->hdr.obj_id_and_type != key.hdr.obj_id_and_type)
-				return IoStatus::Ok;
-			if (k->logical_addr >= offs)
-			{
-				start = k->logical_addr;
-				found = true;
-				return IoStatus::Ok;
-			}
-
-			if (!it.next())
-				return it.HasError() ? IoStatus::IoError : IoStatus::Ok;
-		}
 	}
 
 	bool ReadBlocks(void *data, uint64_t paddr, uint64_t blkcnt, uint64_t crypto_id) override
@@ -814,6 +756,7 @@ bool ApfsDir::LookupName(ApfsDir::DirRec& res, uint64_t parent_id, const char* n
 				if (RawNameEquals(reinterpret_cast<const uint8_t *>(entries[k].name.data()),
 					static_cast<uint16_t>(entries[k].name.size() + 1), name))
 				{
+					log_unicode_fallback(parent_id, name);
 					res.hash = entries[k].hash;
 					res.parent_id = parent_id;
 					res.name = name;
@@ -880,10 +823,10 @@ bool ApfsDir::LookupName(ApfsDir::DirRec& res, uint64_t parent_id, const char* n
 }
 
 bool ApfsDir::ReadFile(void* data, uint64_t inode, uint64_t offs, size_t size,
-	IoStatus *status, uint64_t file_size, bool sparse)
+	IoStatus *status, uint64_t file_size)
 {
 	ExtentSourceImpl source(*this, inode);
-	const IoStatus result = ReadFileInternal(source, data, inode, offs, size, file_size, sparse);
+	const IoStatus result = ReadFileInternal(source, data, inode, offs, size, file_size);
 
 	if (status)
 		*status = result;
@@ -920,7 +863,7 @@ bool ApfsDir::ListAttributes(std::vector<std::string>& names, uint64_t inode, Io
 		if (!rc)
 			break;
 
-		if (!res.key || res.key_len < sizeof(j_xattr_key_t))
+		if (!res.key || res.key_len < sizeof(j_key_t))
 		{
 			if (status)
 				*status = IoStatus::IoError;
@@ -941,6 +884,14 @@ bool ApfsDir::ListAttributes(std::vector<std::string>& names, uint64_t inode, Io
 
 		if ((ekey->hdr.obj_id_and_type >> OBJ_TYPE_SHIFT) > APFS_TYPE_XATTR)
 			break;
+
+		if (res.key_len < sizeof(j_xattr_key_t))
+		{
+			if (status)
+				*status = IoStatus::IoError;
+			names.clear();
+			return false;
+		}
 
 		const size_t name_off = offsetof(j_xattr_key_t, name);
 		const size_t name_len = ekey->name_len;
@@ -1067,7 +1018,7 @@ bool ApfsDir::GetAttribute(std::vector<uint8_t>& data, uint64_t inode, const cha
 
 		try
 		{
-			data.resize(static_cast<size_t>(alloced_size));
+			data.resize(static_cast<size_t>(logical_size));
 		}
 		catch (const std::bad_alloc &)
 		{
@@ -1083,14 +1034,13 @@ bool ApfsDir::GetAttribute(std::vector<uint8_t>& data, uint64_t inode, const cha
 		}
 
 		IoStatus read_status = IoStatus::Ok;
-		if (!ReadFile(data.data(), xstm->xattr_obj_id, 0, data.size(), &read_status, alloced_size, false))
+		if (!ReadFile(data.data(), xstm->xattr_obj_id, 0, data.size(), &read_status, logical_size))
 		{
 			if (status)
 				*status = IoStatus::IoError;
 			data.clear();
 			return false;
 		}
-		data.resize(static_cast<size_t>(logical_size));
 
 		if (g_debug & Dbg_Dir)
 		{

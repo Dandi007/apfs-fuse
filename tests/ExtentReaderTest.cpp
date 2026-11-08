@@ -36,13 +36,11 @@ public:
 	std::map<uint64_t, std::vector<uint8_t>> blocks;
 
 	bool fail_lookup = false;
-	bool fail_next = false;
 	bool fail_read = false;
 	bool force_extent = false;
 	Extent forced = {};
 
 	uint64_t lookup_calls = 0;
-	uint64_t next_calls = 0;
 	std::vector<uint64_t> read_paddrs;
 	std::vector<uint64_t> read_cryptos;
 
@@ -77,27 +75,6 @@ public:
 		out.length = best->length;
 		out.phys_block = best->phys;
 		out.crypto_id = best->crypto;
-		return IoStatus::Ok;
-	}
-
-	IoStatus NextExtentStart(uint64_t ino, uint64_t offs, bool &found, uint64_t &start) override
-	{
-		(void)ino;
-		next_calls++;
-
-		if (fail_next)
-			return IoStatus::IoError;
-
-		const Extent *best = nullptr;
-		for (size_t k = 0; k < extents.size(); k++)
-		{
-			if (extents[k].logical >= offs && (!best || extents[k].logical < best->logical))
-				best = &extents[k];
-		}
-
-		found = best != nullptr;
-		if (found)
-			start = best->logical;
 		return IoStatus::Ok;
 	}
 
@@ -173,17 +150,17 @@ static FakeSource make_source()
 }
 
 static IoStatus read_all(FakeSource &src, uint64_t offs, size_t size, uint64_t file_size,
-	bool sparse, std::vector<uint8_t> &out)
+	std::vector<uint8_t> &out)
 {
 	out.assign(size, 0xAA);
-	return ReadFileInternal(src, out.data(), 1, offs, size, file_size, sparse);
+	return ReadFileInternal(src, out.data(), 1, offs, size, file_size);
 }
 
 static void test_contiguous_read()
 {
 	FakeSource src = make_source();
 	std::vector<uint8_t> out;
-	const IoStatus st = read_all(src, 0, 24, 80, false, out);
+	const IoStatus st = read_all(src, 0, 24, 80, out);
 
 	require(st == IoStatus::Ok, "contiguous read");
 	expect_pattern(out, 0, 24);
@@ -195,54 +172,66 @@ static void test_unaligned_read()
 {
 	FakeSource src = make_source();
 	std::vector<uint8_t> out;
-	const IoStatus st = read_all(src, 3, 5, 80, false, out);
+	const IoStatus st = read_all(src, 3, 5, 80, out);
 
 	require(st == IoStatus::Ok, "unaligned read");
 	expect_pattern(out, 0, 5, 3);
 	require(src.read_paddrs.size() == 1 && src.read_paddrs[0] == 10, "partial read first block");
 }
 
-static void test_interior_hole()
+static void test_explicit_hole()
 {
-	FakeSource src = make_source();
+	FakeSource src;
+	src.add_extent(0, 24, 10);
+	src.add_extent(24, 16, 0); // explicit phys_block == 0 hole
+	src.add_extent(40, 40, 20);
+
 	std::vector<uint8_t> out;
-
-	IoStatus st = read_all(src, 0, 80, 80, true, out);
-	require(st == IoStatus::Ok, "sparse read with interior hole");
+	const IoStatus st = read_all(src, 0, 80, 80, out);
+	require(st == IoStatus::Ok, "explicit hole read");
 	expect_pattern(out, 0, 24);
-	expect_zero(out, 24, 64);
-	expect_pattern(out, 64, 80);
-
-	st = read_all(src, 24, 40, 80, false, out);
-	require(st == IoStatus::IoError, "hole without sparse metadata is an error");
+	expect_zero(out, 24, 40);
+	expect_pattern(out, 40, 80);
 }
 
-static void test_leading_hole()
+static void test_missing_record_gap()
+{
+	FakeSource src = make_source(); // [0,24) and [64,80), no record in between
+	std::vector<uint8_t> out;
+
+	IoStatus st = read_all(src, 0, 80, 80, out);
+	require(st == IoStatus::IoError, "missing record gap must be EIO");
+
+	st = read_all(src, 0, 24, 80, out);
+	require(st == IoStatus::Ok, "read before the gap");
+	expect_pattern(out, 0, 24);
+
+	st = read_all(src, 64, 16, 80, out);
+	require(st == IoStatus::Ok, "read after the gap");
+	expect_pattern(out, 0, 16, 64);
+
+	st = read_all(src, 24, 8, 80, out);
+	require(st == IoStatus::IoError, "read starting inside the gap");
+}
+
+static void test_leading_missing_record()
 {
 	FakeSource src;
 	src.add_extent(64, 16, 20);
 
 	std::vector<uint8_t> out;
-	IoStatus st = read_all(src, 0, 64, 80, true, out);
-	require(st == IoStatus::Ok, "leading hole");
-	expect_zero(out, 0, 64);
-
-	st = read_all(src, 0, 64, 80, false, out);
-	require(st == IoStatus::IoError, "leading hole without sparse metadata");
+	const IoStatus st = read_all(src, 0, 64, 80, out);
+	require(st == IoStatus::IoError, "leading missing record must be EIO");
 }
 
-static void test_trailing_hole()
+static void test_trailing_missing_record()
 {
 	FakeSource src;
 	src.add_extent(0, 24, 10);
 
 	std::vector<uint8_t> out;
-	IoStatus st = read_all(src, 24, 56, 80, true, out);
-	require(st == IoStatus::Ok, "trailing hole");
-	expect_zero(out, 0, 56);
-
-	st = read_all(src, 24, 56, 80, false, out);
-	require(st == IoStatus::IoError, "trailing hole without sparse metadata");
+	const IoStatus st = read_all(src, 24, 56, 80, out);
+	require(st == IoStatus::IoError, "trailing missing record must be EIO");
 }
 
 static void test_lookup_failure_is_not_a_hole()
@@ -251,20 +240,10 @@ static void test_lookup_failure_is_not_a_hole()
 	src.fail_lookup = true;
 
 	std::vector<uint8_t> out;
-	const IoStatus st = read_all(src, 0, 16, 80, true, out);
+	const IoStatus st = read_all(src, 0, 16, 80, out);
 	require(st == IoStatus::IoError, "lookup failure must be EIO");
 	for (size_t k = 0; k < out.size(); k++)
 		require(out[k] == 0xAA, "lookup failure must not zero-fill");
-}
-
-static void test_next_extent_failure()
-{
-	FakeSource src = make_source();
-	src.fail_next = true;
-
-	std::vector<uint8_t> out;
-	const IoStatus st = read_all(src, 24, 8, 80, true, out);
-	require(st == IoStatus::IoError, "next-extent failure inside a hole is EIO");
 }
 
 static void test_read_failure()
@@ -273,7 +252,7 @@ static void test_read_failure()
 	src.fail_read = true;
 
 	std::vector<uint8_t> out;
-	const IoStatus st = read_all(src, 0, 8, 80, false, out);
+	const IoStatus st = read_all(src, 0, 8, 80, out);
 	require(st == IoStatus::IoError, "device read failure is EIO");
 }
 
@@ -284,7 +263,7 @@ static void test_zero_length_extent()
 	src.forced = {0, 0, 10, 0};
 
 	std::vector<uint8_t> out;
-	const IoStatus st = read_all(src, 0, 8, 80, false, out);
+	const IoStatus st = read_all(src, 0, 8, 80, out);
 	require(st == IoStatus::IoError, "zero-length extent is an error");
 }
 
@@ -295,12 +274,8 @@ static void test_extent_start_after_offset()
 	src.forced = {100, 8, 10, 0};
 
 	std::vector<uint8_t> out;
-	IoStatus st = read_all(src, 0, 16, 200, false, out);
-	require(st == IoStatus::IoError, "extent after offset without sparse metadata");
-
-	st = read_all(src, 0, 16, 200, true, out);
-	require(st == IoStatus::Ok, "sparse gap before a later extent");
-	expect_zero(out, 0, 16);
+	const IoStatus st = read_all(src, 0, 16, 200, out);
+	require(st == IoStatus::IoError, "extent starting after the offset is EIO");
 }
 
 static void test_unsigned_boundaries()
@@ -309,13 +284,13 @@ static void test_unsigned_boundaries()
 	std::vector<uint8_t> out;
 
 	IoStatus st = read_all(src, std::numeric_limits<uint64_t>::max() - 4, 16,
-		std::numeric_limits<uint64_t>::max(), false, out);
+		std::numeric_limits<uint64_t>::max(), out);
 	require(st == IoStatus::IoError, "offset plus size overflow");
 
 	src.force_extent = true;
 	src.forced = {std::numeric_limits<uint64_t>::max() - 4, 16, 10, 0};
 	st = read_all(src, std::numeric_limits<uint64_t>::max() - 4, 2,
-		std::numeric_limits<uint64_t>::max(), false, out);
+		std::numeric_limits<uint64_t>::max(), out);
 	require(st == IoStatus::IoError, "extent logical plus length overflow");
 }
 
@@ -324,11 +299,11 @@ static void test_eof_clamp()
 	FakeSource src = make_source();
 	std::vector<uint8_t> out;
 
-	IoStatus st = read_all(src, 100, 16, 80, false, out);
+	IoStatus st = read_all(src, 100, 16, 80, out);
 	require(st == IoStatus::Ok, "read at EOF");
 	require(src.lookup_calls == 0, "read at EOF must not touch the tree");
 
-	st = read_all(src, 16, 16, 20, false, out);
+	st = read_all(src, 16, 16, 20, out);
 	require(st == IoStatus::Ok, "read clamped to EOF");
 	expect_pattern(out, 0, 4, 16);
 	for (size_t k = 4; k < out.size(); k++)
@@ -342,7 +317,7 @@ static void test_explicit_unmapped_extent()
 	src.forced = {0, 8, 0, 0};
 
 	std::vector<uint8_t> out;
-	const IoStatus st = read_all(src, 0, 8, 8, false, out);
+	const IoStatus st = read_all(src, 0, 8, 8, out);
 	require(st == IoStatus::Ok, "physical block 0 extent is a hole");
 	expect_zero(out, 0, 8);
 	require(src.read_paddrs.empty(), "unmapped extent must not read blocks");
@@ -352,7 +327,7 @@ static void test_full_read_crypto_offset()
 {
 	FakeSource src = make_source();
 	std::vector<uint8_t> out;
-	const IoStatus st = read_all(src, 8, 16, 80, false, out);
+	const IoStatus st = read_all(src, 8, 16, 80, out);
 
 	require(st == IoStatus::Ok, "read crossing block boundary");
 	expect_pattern(out, 0, 16, 8);
@@ -364,11 +339,11 @@ int main()
 {
 	test_contiguous_read();
 	test_unaligned_read();
-	test_interior_hole();
-	test_leading_hole();
-	test_trailing_hole();
+	test_explicit_hole();
+	test_missing_record_gap();
+	test_leading_missing_record();
+	test_trailing_missing_record();
 	test_lookup_failure_is_not_a_hole();
-	test_next_extent_failure();
 	test_read_failure();
 	test_zero_length_extent();
 	test_extent_start_after_offset();

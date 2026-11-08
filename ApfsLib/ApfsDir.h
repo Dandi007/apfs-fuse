@@ -129,7 +129,7 @@ public:
 	bool ListDirectory(std::vector<DirRec> &dir, uint64_t inode, IoStatus *status = nullptr);
 	bool LookupName(DirRec &res, uint64_t parent_id, const char *name, IoStatus *status = nullptr);
 	bool ReadFile(void *data, uint64_t inode, uint64_t offs, size_t size,
-		IoStatus *status = nullptr, uint64_t file_size = UINT64_MAX, bool sparse = false);
+		IoStatus *status = nullptr, uint64_t file_size = UINT64_MAX);
 	bool ListAttributes(std::vector<std::string> &names, uint64_t inode, IoStatus *status = nullptr);
 	bool GetAttribute(std::vector<uint8_t> &data, uint64_t inode, const char *name, IoStatus *status = nullptr);
 	bool GetAttributeInfo(XAttr &attr, uint64_t inode, const char *name, IoStatus *status = nullptr);
