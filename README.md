@@ -71,6 +71,8 @@ apfs-fuse <device> <mount-directory>
 #### Supported options:
 * `-d n`: If n > 0, enable debug output (see below for details).
 * `-f device`: Specify secondary device for Fusion drive.
+* `-F`: Stay in the foreground; do not daemonize. This does not enable debug output,
+  so stderr keeps only the fixed diagnostics and can be redirected by a wrapper.
 * `-o opts`: Comma-separated list of mount options.
 * `-l`: Lax mode: when unexpected data is encountered, try to continue, even if this means
   returning potentially incorrect data.

@@ -1640,6 +1640,38 @@ namespace
 			WriteLE32(carrier, 0x100 + 20, 16);
 			if (!AddRfRecord(entries, 92, "rf-bad-map-block", 4,
 				RF_BLOCK_SIZE + 12345, carrier, error)) return false;
+
+			// Mixed carrier: first block is zlib with Adler-32, second is the
+			// 0xFF raw marker plus plaintext. Raw blocks have no checksum and
+			// must never be reported as checksum-verified.
+			std::vector<uint8_t> raw_tail;
+			raw_tail.reserve(124);
+			raw_tail.push_back(0xFF);
+			raw_tail.insert(raw_tail.end(), plain.begin(), plain.begin() + 123);
+			std::vector<uint8_t> mixed_payload = first;
+			mixed_payload.insert(mixed_payload.end(), raw_tail.begin(),
+				raw_tail.end());
+			std::vector<std::pair<uint32_t, uint32_t>> mixed_table = {
+				{start, static_cast<uint32_t>(first.size())},
+				{start + static_cast<uint32_t>(first.size()),
+					static_cast<uint32_t>(raw_tail.size())}};
+			auto mixed_data = MakeType4Data(2, mixed_table, mixed_payload, start);
+			WriteBE32(mixed_data, 0, static_cast<uint32_t>(mixed_data.size() - 4));
+			auto mixed_carrier = MakeType4Carrier(0x100, mixed_data);
+			WriteBE32(mixed_carrier, 4, static_cast<uint32_t>(mixed_carrier.size()));
+			WriteBE32(mixed_carrier, 12, 50);
+			mixed_carrier.insert(mixed_carrier.end(), 50, 0xA5);
+			if (!AddRfRecord(entries, 93, "rf-mixed-zlib-raw", 4,
+				RF_BLOCK_SIZE + 123, mixed_carrier, error)) return false;
+
+			// Declared data_size one byte past the real carrier. The vector is
+			// not expanded, so only the bounds check can reject this; relying
+			// on allocated slack would hide an out-of-range read.
+			std::vector<uint8_t> beyond = mixed_carrier;
+			WriteBE32(beyond, 8,
+				static_cast<uint32_t>(beyond.size() - 0x100 + 1));
+			if (!AddRfRecord(entries, 94, "rf-bad-data-size-beyond", 4,
+				RF_BLOCK_SIZE + 123, beyond, error)) return false;
 		}
 
 		return true;
