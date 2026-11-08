@@ -675,8 +675,6 @@ static void apfs_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, st
 		bool sparse = false;
 		if (file->ino.optional_present_flags & ApfsDir::Inode::INO_HAS_SPARSE_BYTES)
 			sparse = file->ino.sparse_bytes > 0;
-		if (!sparse && (file->ino.optional_present_flags & ApfsDir::Inode::INO_HAS_DSTREAM))
-			sparse = file->ino.ds_alloced_size < file->ino.ds_size;
 
 		std::vector<char> buf(want);
 		IoStatus status = IoStatus::Ok;

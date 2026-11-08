@@ -47,12 +47,12 @@
 
 - 先检查 `offs + size` 溢出、extent `logical + length` 溢出、`phys_block + block_index` / `+ block_count` 溢出。
 - 查找使用“最后一个起点不大于 offs 的 extent”。若返回 extent 起点在 offs 之后，先判断为 gap，不做无符号减法。
-- 合法 hole 的条件：调用者提供 `sparse_allowed=true`，且 inode 元数据证明稀疏（`sparse_bytes > 0`，或 allocated size 小于 logical size）。hole 的终点取下一个 extent 起点或 EOF，不能越过下一个 extent。
+- 合法 hole 的条件：调用者提供 `sparse_allowed=true`，且 inode 元数据显式证明稀疏（`sparse_bytes > 0`）。hole 的终点取下一个 extent 起点或 EOF，不能越过下一个 extent。
 - 没有 extent 覆盖、且 `sparse_allowed=false` 时返回 `IoError`，不填零。
 - extent 树查找失败、节点加载失败、设备读取失败或短读一律返回 `IoError`。
 - `phys_block == 0` 的 extent 按显式空洞处理；这是 APFS 中已验证的未映射语义。
 - `file_size` 用于 EOF clamp：越过 EOF 的读取返回 0 字节，不访问 extent；预分配尾部不会越界读取。
-- FUSE 层根据 inode 的 `ds_size` 计算 EOF，并把 `sparse_bytes` 或 `alloced_size < ds_size` 作为稀疏证据。
+- FUSE 层根据 inode 的 `ds_size` 计算 EOF，并且只在 `sparse_bytes > 0` 时允许 hole 零填充；不把 allocated size 差当作稀疏证据，避免 clone/dedup 文件的缺失 extent 被误判为合法空洞。
 
 ### 4.3 Unicode 精确回退
 
