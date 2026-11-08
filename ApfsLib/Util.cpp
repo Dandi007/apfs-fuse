@@ -428,7 +428,7 @@ bool GetPassword(std::string &pw)
 #endif
 }
 
-size_t DecompressZLib(uint8_t *dst, size_t dst_size, const uint8_t *src, size_t src_size)
+size_t DecompressZLib(uint8_t *dst, size_t dst_size, const uint8_t *src, size_t src_size, bool allow_missing_adler)
 {
 	int ret;
 
@@ -466,9 +466,19 @@ size_t DecompressZLib(uint8_t *dst, size_t dst_size, const uint8_t *src, size_t 
 		const uInt avail_in = strm.avail_in;
 		const uInt avail_out = strm.avail_out;
 
-		ret = inflate(&strm, Z_NO_FLUSH);
+		ret = inflate(&strm, allow_missing_adler ? Z_BLOCK : Z_NO_FLUSH);
 
 		if (ret == Z_STREAM_END)
+		{
+			complete = true;
+			break;
+		}
+
+		// Z_BLOCK exposes the exact final DEFLATE boundary before CHECK.
+		// Accept absent checksum only there, never a partially present trailer.
+		if (allow_missing_adler && ret == Z_OK &&
+			(strm.data_type & 0xC0) == 0xC0 &&
+			strm.avail_in == 0 && strm.total_out > 0)
 		{
 			complete = true;
 			break;
@@ -487,12 +497,14 @@ size_t DecompressZLib(uint8_t *dst, size_t dst_size, const uint8_t *src, size_t 
 			break;
 	}
 
+	const uLong stream_total_in = strm.total_in;
+
 	const size_t decoded = dst_size - strm.avail_out;
 
 	if (!complete)
 		std::cerr << "APFS_ZLIB_ERROR ret=" << ret
 			<< " msg=" << (strm.msg ? strm.msg : "none")
-			<< " total_in=" << strm.total_in << " total_out=" << strm.total_out
+			<< " total_in=" << stream_total_in << " total_out=" << strm.total_out
 			<< " src_size=" << src_size << " dst_size=" << dst_size << std::endl;
 
 	inflateEnd(&strm);

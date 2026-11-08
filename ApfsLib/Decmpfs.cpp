@@ -179,7 +179,7 @@ bool DecompressFile(ApfsDir &dir, uint64_t ino, std::vector<uint8_t> &decompress
 
 				if (src[0] == 0x78)
 				{
-					decoded_bytes = DecompressZLib(dst, 0x10000, src, src_len);
+					decoded_bytes = DecompressZLib(dst, 0x10000, src, src_len, true);
 				}
 				else if ((src[0] & 0x0F) == 0x0F)
 				{
@@ -271,7 +271,7 @@ bool DecompressFile(ApfsDir &dir, uint64_t ino, std::vector<uint8_t> &decompress
 		switch (hdr->algo) {
 		case 3:
 			if (cdata[0] == 0x78)
-				decoded_bytes = DecompressZLib(decompressed.data(), decompressed.size(), cdata, csize);
+				decoded_bytes = DecompressZLib(decompressed.data(), decompressed.size(), cdata, csize, true);
 			else if (cdata[0] == 0xFF) {
 				assert(hdr->size == csize - 1);
 				decompressed.assign(cdata + 1, cdata + csize);
