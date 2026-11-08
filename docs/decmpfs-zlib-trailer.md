@@ -104,3 +104,5 @@ old implementation returned 0 for the native 86-byte block
 ## 9. 审查修正与自验
 
 P2-1以Z_BLOCK确定性边界替代合成Adler；P2-2默认严格模式，仅decmpfs type3/4 opt-in；P2-3许可与固定来源修正。新增stored/fixed/dynamic每个截断点及adler首尾碰撞的部分trailer负例、默认拒绝无尾正例。Debug/Release各5 PASS、1既有lookup-generation skip；本轮未跑FUSE。真实重放前还必须补resource fork块数与范围校验、逐对象缺尾诊断、重新绑定reader与M0，并独立复核阶段条件。
+
+构建证据纠正：71d422e的测试源码含vector构造误参数，构建失败；当时未启用shell fail-fast，ctest实际运行旧二进制，不能作为新测试证据。后续删除误参数，使用set -e依次构建并测试Debug/Release，两者均5 PASS、1既有skip。新证据日志为owner-build-fixed.log / owner-debug-fixed.log / owner-release-build-fixed.log / owner-release-fixed.log，位于/data/tmp/apfs-zlib-format-20261109。

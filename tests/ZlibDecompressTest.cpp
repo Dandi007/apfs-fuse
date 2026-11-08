@@ -396,7 +396,7 @@ int main()
 	{
 		begin("native block with a wrong trailer fails closed");
 		std::vector<uint8_t> src(kNativeDecmpfsBlock,
-			kNativeDecmpfsBlock + sizeof(kNativeDecmpfsBlock), true);
+			kNativeDecmpfsBlock + sizeof(kNativeDecmpfsBlock));
 		src.insert(src.end(), {0x00, 0x00, 0x00, 0x00});
 
 		std::vector<uint8_t> out(0x10000, 0xAA);
