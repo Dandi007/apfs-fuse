@@ -164,8 +164,9 @@ if (BUILD_TESTING)
   target_link_libraries(reader-policy-test apfs)
   add_test(NAME reader-policy COMMAND reader-policy-test)
 
-  add_library(apfs-fixture STATIC tests/ApfsFixture.cpp tests/ApfsFixture.h)
-  target_link_libraries(apfs-fixture apfs)
+  add_library(apfs-fixture STATIC tests/ApfsFixture.cpp tests/ApfsFixture.h
+    tests/RfContent.cpp tests/RfContent.h)
+  target_link_libraries(apfs-fixture apfs lzfse z)
 
   add_executable(reader-integration-test tests/ApfsReaderIntegrationTest.cpp)
   target_link_libraries(reader-integration-test apfs apfs-fixture)
