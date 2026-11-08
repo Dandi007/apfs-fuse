@@ -1,6 +1,6 @@
 # APFS decmpfs zlib：缺失 Adler-32 的兼容修复
 
-状态：实现稿，供独立 review。分支 `fix/zlib-format-evidence` 基于个人 fork `personal/master` 的 `dc8dc94`。只改 `DecompressZLib`、其单元测试和本文，不访问真实源盘或生产挂载。
+状态：实现稿，供独立 review。分支 `fix/zlib-format-evidence` 基于个人 fork `personal/master` 的 `dc8dc94`。修改 `DecompressZLib`、decmpfs调用点、单元测试和本文，不访问真实源盘或生产挂载。
 
 ## 1. 背景与现场证据
 
@@ -21,7 +21,7 @@ H-R4 的 111 键样本结果为 89 成功、1 个预期 class6 错误、21 个 u
 
 APFS 写端未开源，但 AppleFSCompression 的行为有可核验的原生抓包：
 
-- 仓库 `deploymenttheory/go-apfs-v2`（Apache-2.0）的 `testdata/appledouble/native/compression-writer.json.gz` 记录了 macOS 27.0.1（build 26A434）、SDK 27.0 上由 `AppleFSCompression.framework`（UUID `3B5065D1-5D8A-3443-B4B8-293DA9FE47C3`）实际写出的 33 组 type selection，包含原生 `Attribute` 与 `Fork` 字节。
+- 仓库 `deploymenttheory/go-apfs-v2`（MIT）的 `testdata/appledouble/native/compression-writer.json.gz` 记录了 macOS 27.0.1（build 26A434）、SDK 27.0 上由 `AppleFSCompression.framework`（UUID `3B5065D1-5D8A-3443-B4B8-293DA9FE47C3`）实际写出的 33 组 type selection，包含原生 `Attribute` 与 `Fork` 字节。
 - 该仓库的测试要求自家 encoder 对同一选择产生的字节与原生 `Fork` **完全一致**（`bytes.Equal`），因此这些字节可以作为独立黄金样本。
 
 取 `requested type 4`（zlib + resource fork）的一条 64 KiB 文件：
@@ -44,41 +44,26 @@ APFS 写端未开源，但 AppleFSCompression 的行为有可核验的原生抓�
 
 布局核对：本仓库 `Decmpfs.cpp`（`data_offset + 4` 为基址、LE count、8 字节 `{offset, size}`）与 keramics 的 `offset 260/264`、`block offset + 260` 完全一致，也与上述原生 fork 吻合。因此块边界定位正确，问题只在流的终止判定。
 
-结论：**缺失 Adler-32 是 APFS decmpfs zlib 的合法磁盘格式，不是损坏。** 对每个 type-4 块都成立，所以现有 reader 会把这类文件系统性地判成 EIO；21 个是本次 111 键样本中实际被触发的数量，不能反过来证明其他 89 个键不含 zlib（未做逐对象取证）。
+结论：**缺失 Adler-32 是 APFS decmpfs zlib 的合法磁盘格式，不是损坏。** 独立审查复核的第三方抓包中170个type-4块均为该形态；这能解释现场日志模式，但不能证明21个现场文件无损，也不能反推其他89个键的压缩类型。
 
 ## 3. 需求
 
 - **R1 合法格式可读**：接受“zlib header + 完整 DEFLATE + 无 Adler-32”的 decmpfs 块，返回准确字节数与内容。
 - **R2 失败仍 fail-closed**：截断（包括只缺尾部若干字节）、错误 trailer、输出缓冲不足、字典流、空输入仍返回 0，且时间有界。
 - **R3 语义不回退**：带正确 trailer 的普通 zlib 流、`Z_STREAM_END` 之后的 trailing bytes、精确 64 KiB 输出保持原行为。
-- **R4 最小改动**：只改 `DecompressZLib` 与单测，不改调用方、不改其他压缩算法、不新增依赖。
+- **R4 最小改动**：只修改 zlib 边界和 decmpfs 显式调用，不改其他压缩算法、不新增依赖。
 
 ## 4. 设计
 
-`ApfsLib/Util.cpp` 的 fail-closed 循环保持不变（只在 `Z_STREAM_END` 置 `complete`，其他非 `Z_OK` 或“无进展”退出）。新增一条受控完成路径：
+`DecompressZLib` 新增 `allow_missing_adler=false` 参数，只有 decmpfs type 3/4 显式传 true。type 4 有第三方原生抓包；type 3 共用协议是推断，没有原生样本。DMG 等其他调用仍要求完整校验。
 
-1. 仅当 `!complete`、`ret` 为 `Z_BUF_ERROR` 或 `Z_OK`、`avail_in == 0`、`total_out > 0` 时尝试；
-2. 用 zlib 的 `adler32()` 计算已产出字节的校验值；
-3. 把这 4 字节作为 `next_in` 再调用一次 `inflate()`；
-4. 只有返回 `Z_STREAM_END` 才置 `complete = true`。
+显式启用时使用 zlib `Z_BLOCK`，只有 `ret==Z_OK`、`(data_type & 0xC0)==0xC0`、`avail_in==0`、`total_out>0` 才接受缺尾：zlib 确认当前位置是最后一个 DEFLATE block 的结束边界。存在剩余输入时继续正常解码，要求完整正确的 Adler-32；部分 trailer 1–3 字节一律失败，不合成校验值。普通完整流仍以 Z_STREAM_END 成功，错误和无进展有界退出。
 
-该判据比“输入耗尽 + 长度正确”严格：
-
-- **真正的截断**：4 字节会被当成后续压缩数据继续解析，无法恰好进入 CHECK 状态并结束，仍返回 0；
-- **trailer 存在但错误**：`inflate()` 在 CHECK 状态返回 `Z_DATA_ERROR`，走原有失败分支（现有 case 5、新增 case 13 覆盖）；
-- **输出缓冲不足**：此时 `avail_in > 0`，不进入该路径；
-- **精确填满输出缓冲**（现场 `total_out=65536` 那条）：CHECK 校验不需要输出空间，C 探针实测 `avail_out==0` 时补 trailer 仍返回 `Z_STREAM_END`；
-- 只多一次 `inflate()` 调用，时间有界，不会重新引入空转。
-
-残余语义：既然格式本身没有生产者写入的 Adler-32，reader 就无法对这类块做内容校验；“内容被改但仍构成合法且更短的 DEFLATE 流”只能由调用方的长度检查兜底。`Decmpfs.cpp` 对每个块要求 `decoded_bytes == expected_len`，长度不符仍拒绝。原生 macOS 读端面对同一格式也没有该校验，这是格式本身的边界，不是本修复引入的。
+缺少生产者 checksum 的内容只有结构及调用方长度检查。合法编码内部的位翻转可能解出同长度错误内容；不能将解码成功或内容SHA称为独立完整性验证。真实21文件没有逐对象字节证据，不能宣称无损。
 
 ## 5. 修改范围
 
-- `ApfsLib/Util.cpp`：`DecompressZLib` 增加上述受控完成路径；失败诊断中的 `total_in` 固定使用补 trailer 之前的真实消费数，避免把合成 trailer 计入现场证据。
-- `tests/ZlibDecompressTest.cpp`：新增 case 11–19（原生黄金块、截断、错误 trailer、普通流去 trailer、精确 64 KiB、多块短尾）。
-- `docs/decmpfs-zlib-trailer.md`：本文。
-
-未修改 `Decmpfs.cpp`、调用方、CMake、ADC/LZVN/LZFSE/LZBITMAP。
+Util.cpp/Util.h 实现显式opt-in和确定性边界；Decmpfs.cpp两处调用开启；独立单测覆盖默认严格模式、stored/fixed/dynamic所有截断点及部分trailer碰撞。原生抓包固定 upstream commit `2bd8a20b`，文件SHA256 `2dbeb1ced7175692d0de004c96a9328acded752744687e973a744db6bd1133cc`（MIT）。
 
 ## 6. 验收
 
@@ -113,5 +98,9 @@ old implementation returned 0 for the native 86-byte block
 - **type 3 inline zlib 未直接观测**：修复在函数级生效，但原生抓包只覆盖 type 4；同一 producer/encoder 的推断成立性未验证。现场 21 条 `dst_size=65536` 均为 type 4，不受影响。
 - **无 trailer 时无内容校验**：只能依赖调用方长度检查；这是磁盘格式的固有限制。
 - **resource fork 表未做越界校验**：`Decmpfs.cpp` 目前不检查 `src_offset + src_len` 是否落在 rsrc 内，属既有缺口，本 PR 不扩大范围，建议另开。
-- **DMG 路径**：`DeviceDMG.cpp` 共用 `DecompressZLib`，终止语义变化对其有益，但未单独测试。
+- **DMG 路径**：`DeviceDMG.cpp` 共用 `DecompressZLib`，默认严格校验不启用缺尾兼容，既有忽略返回值问题仍未处理。
 - **未对 21 个现场对象逐条取证**：按约束不访问生产挂载；结论基于“原生格式系统性 + 现场日志签名完全一致”，不是对每个对象的独立证明。
+
+## 9. 审查修正与自验
+
+P2-1以Z_BLOCK确定性边界替代合成Adler；P2-2默认严格模式，仅decmpfs type3/4 opt-in；P2-3许可与固定来源修正。新增stored/fixed/dynamic每个截断点及adler首尾碰撞的部分trailer负例、默认拒绝无尾正例。Debug/Release各5 PASS、1既有lookup-generation skip；本轮未跑FUSE。真实重放前还必须补resource fork块数与范围校验、逐对象缺尾诊断、重新绑定reader与M0，并独立复核阶段条件。

@@ -46,7 +46,7 @@ int StrCmpUtf8NormalizedFolded(const uint8_t *s1, const uint8_t *s2, bool case_f
 
 bool Utf8toUtf32(std::vector<char32_t> &str32, const uint8_t * str);
 
-size_t DecompressZLib(uint8_t *dst, size_t dst_size, const uint8_t *src, size_t src_size);
+size_t DecompressZLib(uint8_t *dst, size_t dst_size, const uint8_t *src, size_t src_size, bool allow_missing_adler = false);
 size_t DecompressADC(uint8_t *dst, size_t dst_size, const uint8_t *src, size_t src_size);
 size_t DecompressLZVN(uint8_t *dst, size_t dst_size, const uint8_t *src, size_t src_size);
 size_t DecompressBZ2(uint8_t *dst, size_t dst_size, const uint8_t *src, size_t src_size);

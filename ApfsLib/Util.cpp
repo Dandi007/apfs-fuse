@@ -428,7 +428,7 @@ bool GetPassword(std::string &pw)
 #endif
 }
 
-size_t DecompressZLib(uint8_t *dst, size_t dst_size, const uint8_t *src, size_t src_size)
+size_t DecompressZLib(uint8_t *dst, size_t dst_size, const uint8_t *src, size_t src_size, bool allow_missing_adler)
 {
 	int ret;
 
@@ -466,9 +466,19 @@ size_t DecompressZLib(uint8_t *dst, size_t dst_size, const uint8_t *src, size_t 
 		const uInt avail_in = strm.avail_in;
 		const uInt avail_out = strm.avail_out;
 
-		ret = inflate(&strm, Z_NO_FLUSH);
+		ret = inflate(&strm, allow_missing_adler ? Z_BLOCK : Z_NO_FLUSH);
 
 		if (ret == Z_STREAM_END)
+		{
+			complete = true;
+			break;
+		}
+
+		// Z_BLOCK exposes the exact final DEFLATE boundary before CHECK.
+		// Accept absent checksum only there, never a partially present trailer.
+		if (allow_missing_adler && ret == Z_OK &&
+			(strm.data_type & 0xC0) == 0xC0 &&
+			strm.avail_in == 0 && strm.total_out > 0)
 		{
 			complete = true;
 			break;
@@ -488,41 +498,6 @@ size_t DecompressZLib(uint8_t *dst, size_t dst_size, const uint8_t *src, size_t 
 	}
 
 	const uLong stream_total_in = strm.total_in;
-
-	// APFS decmpfs zlib chunks end after the final DEFLATE block and omit
-	// the RFC 1950 Adler-32 trailer. A block produced by Apple's native
-	// writer (AppleFSCompression.framework, captured from macOS) decodes to
-	// its full expected length, consumes every input byte, and then stops in
-	// zlib's checksum state, so inflate() ends with Z_BUF_ERROR instead of
-	// Z_STREAM_END (zlib can report Z_OK once and Z_BUF_ERROR on the next
-	// call, hence both are covered below). Rejecting that form turns every
-	// such file into EIO.
-	//
-	// Accept it only when the input was consumed completely (so this is not
-	// an output buffer shortage) and some output was produced. Supplying the
-	// Adler-32 of the decoded bytes then makes inflate() finish only if the
-	// original input ended exactly at the end of the final DEFLATE block.
-	// A stream truncated inside the DEFLATE data consumes this trailer as
-	// more compressed data and cannot reach Z_STREAM_END, and a stream whose
-	// trailer is present but wrong still fails with Z_DATA_ERROR above.
-	if (!complete && (ret == Z_BUF_ERROR || ret == Z_OK) &&
-		strm.avail_in == 0 && strm.total_out > 0)
-	{
-		uLong adler = adler32(0L, Z_NULL, 0);
-		adler = adler32(adler, dst, static_cast<uInt>(strm.total_out));
-
-		uint8_t trailer[4];
-		trailer[0] = static_cast<uint8_t>(adler >> 24);
-		trailer[1] = static_cast<uint8_t>(adler >> 16);
-		trailer[2] = static_cast<uint8_t>(adler >> 8);
-		trailer[3] = static_cast<uint8_t>(adler);
-
-		strm.next_in = trailer;
-		strm.avail_in = 4;
-
-		if (inflate(&strm, Z_NO_FLUSH) == Z_STREAM_END)
-			complete = true;
-	}
 
 	const size_t decoded = dst_size - strm.avail_out;
 

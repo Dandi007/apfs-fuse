@@ -150,8 +150,9 @@ static void require_same_content(const std::vector<uint8_t> &expected,
 // written by Apple's own filesystem compression support. Captured from
 // AppleFSCompression.framework on macOS 27.0.1 (build 26A434), SDK 27.0.
 // Provenance: deploymenttheory/go-apfs-v2, testdata/appledouble/native/
-// compression-writer.json.gz (Apache-2.0), selection requested type 4.
+// compression-writer.json.gz (MIT), upstream commit 2bd8a20b, selection requested type 4.
 //
+// Capture SHA256: 2dbeb1ced7175692d0de004c96a9328acded752744687e973a744db6bd1133cc
 // The block is a zlib header plus complete DEFLATE data and ends at the
 // final block; the four Adler-32 trailer bytes are absent. Its uncompressed
 // SHA-256 is the independent golden anchor for the decoder.
@@ -363,7 +364,7 @@ int main()
 
 		require(run_with_timeout(5, [&]() {
 			return DecompressZLib(out.data(), out.size(), kNativeDecmpfsBlock,
-				sizeof(kNativeDecmpfsBlock));
+				sizeof(kNativeDecmpfsBlock), true);
 		}, decoded), "native trailer-less block hung");
 
 		require(decoded == 0x10000, "native trailer-less block was not accepted");
@@ -383,7 +384,7 @@ int main()
 
 			require(run_with_timeout(2, [&]() {
 				return DecompressZLib(out.data(), out.size(),
-					kNativeDecmpfsBlock, size);
+					kNativeDecmpfsBlock, size, true);
 			}, decoded), "truncated native block hung");
 			require(decoded == 0,
 				"truncated native block reported a plausible length");
@@ -395,14 +396,14 @@ int main()
 	{
 		begin("native block with a wrong trailer fails closed");
 		std::vector<uint8_t> src(kNativeDecmpfsBlock,
-			kNativeDecmpfsBlock + sizeof(kNativeDecmpfsBlock));
+			kNativeDecmpfsBlock + sizeof(kNativeDecmpfsBlock), true);
 		src.insert(src.end(), {0x00, 0x00, 0x00, 0x00});
 
 		std::vector<uint8_t> out(0x10000, 0xAA);
 		size_t decoded = 123;
 
 		require(run_with_timeout(2, [&]() {
-			return DecompressZLib(out.data(), out.size(), src.data(), src.size());
+			return DecompressZLib(out.data(), out.size(), src.data(), src.size(), true);
 		}, decoded), "wrong-trailer native block hung");
 		require(decoded == 0, "wrong trailer was accepted as success");
 	}
@@ -420,7 +421,7 @@ int main()
 
 		require(run_with_timeout(5, [&]() {
 			return DecompressZLib(out.data(), out.size(), compressed.data(),
-				compressed.size());
+				compressed.size(), true);
 		}, decoded), "trailer-less zlib stream hung");
 		require(decoded == plain.size(), "trailer-less zlib length mismatch");
 		require_same_content(plain, out, decoded,
@@ -441,7 +442,7 @@ int main()
 
 		require(run_with_timeout(5, [&]() {
 			return DecompressZLib(out.data(), out.size(), compressed.data(),
-				compressed.size());
+				compressed.size(), true);
 		}, decoded), "exact 64KiB trailer-less stream hung");
 		require(decoded == plain.size(), "exact 64KiB trailer-less length mismatch");
 		require_same_content(plain, out, decoded,
@@ -468,7 +469,7 @@ int main()
 
 			require(run_with_timeout(5, [&]() {
 				return DecompressZLib(out.data(), out.size(), compressed.data(),
-					compressed.size());
+					compressed.size(), true);
 			}, decoded), "multi-block trailer-less stream hung");
 			require(decoded == block_size,
 				"multi-block trailer-less stream returned the wrong length");
@@ -477,6 +478,57 @@ int main()
 
 		require_same_content(plain, joined, joined.size(),
 			"multi-block trailer-less SHA-256 mismatch");
+	}
+
+	{
+		begin("missing checksum requires explicit opt-in");
+		std::vector<uint8_t> out(65536);
+		require(DecompressZLib(out.data(), out.size(), kNativeDecmpfsBlock,
+			sizeof(kNativeDecmpfsBlock)) == 0, "default accepted absent checksum");
+	}
+	{
+		begin("all truncation offsets: stored, fixed and dynamic blocks");
+		for (int kind = 0; kind < 3; ++kind)
+		{
+			std::vector<uint8_t> plain(4096);
+			for (size_t i = 0; i < plain.size(); ++i)
+				plain[i] = static_cast<uint8_t>((i * i + i / 17) % 23);
+			z_stream z = {};
+			require(deflateInit2(&z, kind == 0 ? 0 : 6, Z_DEFLATED, 15, 8,
+				kind == 1 ? Z_FIXED : Z_DEFAULT_STRATEGY) == Z_OK, "init encoder");
+			std::vector<uint8_t> input(compressBound(plain.size()) + 64);
+			z.next_in = plain.data(); z.avail_in = plain.size();
+			z.next_out = input.data(); z.avail_out = input.size();
+			require(deflate(&z, Z_FINISH) == Z_STREAM_END, "finish encoder");
+			input.resize(z.total_out); deflateEnd(&z);
+			require(((input[2] >> 1) & 3) == kind, "fixture block type mismatch");
+			std::vector<uint8_t> out(plain.size());
+			for (size_t cut = 0; cut <= input.size(); ++cut)
+			{
+				const size_t n = DecompressZLib(out.data(), out.size(), input.data(), cut, true);
+				if (cut == input.size() || cut == input.size() - 4)
+					require_same_content(plain, out, n, "boundary content mismatch");
+				else
+					require(n == 0, "accepted truncated DEFLATE or partial checksum");
+			}
+		}
+	}
+	{
+		begin("partial trailer collision is rejected deterministically");
+		bool found = false;
+		for (unsigned seed = 0; seed < 65536 && !found; ++seed)
+		{
+			auto plain = make_pattern(128, seed);
+			auto input = zlib_compress(plain);
+			const size_t n = input.size();
+			if (input[n - 1] != input[n - 4]) continue;
+			found = true;
+			std::vector<uint8_t> out(plain.size());
+			for (size_t removed = 1; removed <= 3; ++removed)
+				require(DecompressZLib(out.data(), out.size(), input.data(), n - removed, true) == 0,
+					"partial trailer collision accepted");
+		}
+		require(found, "collision fixture not found");
 	}
 
 	std::cout << g_case_count << " DecompressZLib cases passed" << std::endl;
