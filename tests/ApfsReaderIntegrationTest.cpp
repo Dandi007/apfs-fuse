@@ -74,6 +74,7 @@ static void requireBytes(const std::vector<uint8_t> &actual,
 }
 
 static void TestResourceForkContent(ApfsDir &dir);
+static void TestHardLinkAliases(ApfsDir &dir);
 static void TestMissingAdlerDiagnostics(ApfsDir &dir, const std::string &image_path);
 static void TestRfBoundsRejects(ApfsDir &dir, const std::string &image_path);
 static void TestInlineZlibContent(ApfsDir &dir, const std::string &image_path);
@@ -340,11 +341,35 @@ static void TestGoodImage(const std::string &path)
 	require(ClassifyInodeCompression(dir, rec, usize, attr_size, 0) ==
 		CompressionClass::InlineAttr, "unlimited decompression accepts the same inode");
 
+	TestHardLinkAliases(dir);
 	TestResourceForkContent(dir);
 	TestMissingAdlerDiagnostics(dir, path);
 	TestRfBoundsRejects(dir, path);
 	TestInlineZlibContent(dir, path);
 	TestObjectDiagnostics(dir, path);
+}
+
+// The compressed single-block fixture inode 60 has two directory entries.
+// Both names must resolve to the same inode so the FUSE-level test can model
+// a manifest that opens each hardlink path independently.
+static void TestHardLinkAliases(ApfsDir &dir)
+{
+	IoStatus st = IoStatus::Ok;
+	ApfsDir::DirRec primary;
+	ApfsDir::DirRec alias;
+
+	require(dir.LookupName(primary, 2, "rf-zlib-1blk", &st) && st == IoStatus::Ok,
+		"hardlink primary name lookup");
+	require(primary.file_id == 60, "hardlink primary name resolves to ino 60");
+	require(dir.LookupName(alias, 2, "rf-zlib-1blk-hardlink", &st) && st == IoStatus::Ok,
+		"hardlink alias name lookup");
+	require(alias.file_id == 60, "hardlink alias resolves to ino 60");
+	require(primary.file_id == alias.file_id,
+		"hardlink names must share one inode");
+
+	ApfsDir::Inode rec;
+	require(dir.GetInode(rec, 60, &st) && st == IoStatus::Ok, "hardlink inode");
+	require(rec.nchildren_nlink == 2, "hardlink inode nlink");
 }
 
 static void TestResourceForkContent(ApfsDir &dir)

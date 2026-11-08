@@ -12,7 +12,7 @@ import time
 BIN = sys.argv[1]
 WORK = sys.argv[2]
 FUSERMOUNT = sys.argv[3]
-MNT = os.path.join(WORK, "mnt")
+MNT = sys.argv[4] if len(sys.argv) > 4 else os.path.join(WORK, "mnt")
 
 USE_SUDO = os.environ.get("APFS_FUSE_USE_SUDO") == "1"
 PREFIX = ["sudo", "-n"] if USE_SUDO else []
@@ -45,6 +45,28 @@ INLINE_ZLIB_GOLDEN = {
 # partial data. In the default (strict, non `-l`) mode open() is EIO.
 DAMAGED_ZLIB = ("inline-zlib-truncated", "inline-zlib-corrupt")
 
+# Inode 60 (rf-zlib-1blk) also carries a second directory entry. Opening each
+# hardlink path separately, as a manifest does, must produce one complete
+# OBJECT record per open even when the second handle is never read.
+HARDLINK_ALIAS = "rf-zlib-1blk-hardlink"
+HARDLINK_GOLDEN = RF_GOLDEN["rf-zlib-1blk"]
+OBJECT_FIELDS = (b"seq", b"ino", b"algo", b"logical_size", b"blocks", b"zlib",
+                 b"raw", b"native", b"missing_adler", b"validation",
+                 b"checksum_verified", b"result")
+HARDLINK_OBJECT = {
+    b"ino": b"60",
+    b"algo": b"4",
+    b"logical_size": b"65536",
+    b"blocks": b"1",
+    b"zlib": b"1",
+    b"raw": b"0",
+    b"native": b"0",
+    b"missing_adler": b"0",
+    b"validation": b"checksum",
+    b"checksum_verified": b"1",
+    b"result": b"ok",
+}
+
 libc = ctypes.CDLL("libc.so.6", use_errno=True)
 
 
@@ -55,10 +77,14 @@ def fail(message):
 
 FOREGROUND = None
 FOREGROUND_LOG = None
+FOREGROUND_STDOUT = None
+FOREGROUND_LOG_PATH = None
+FOREGROUND_STDOUT_PATH = None
 
 
 def mount(image, extra=(), foreground=False):
-    global FOREGROUND, FOREGROUND_LOG
+    global FOREGROUND, FOREGROUND_LOG, FOREGROUND_STDOUT
+    global FOREGROUND_LOG_PATH, FOREGROUND_STDOUT_PATH
     args = [BIN]
     options = []
     if extra:
@@ -67,9 +93,16 @@ def mount(image, extra=(), foreground=False):
         args.extend(["-o", ",".join(options)])
     args.extend([image, MNT])
     if foreground:
-        FOREGROUND_LOG = open(os.path.join(WORK, "foreground.log"), "wb")
-        FOREGROUND = subprocess.Popen(PREFIX + [BIN, "-d", "1"] + args[1:],
-                                      stdout=FOREGROUND_LOG, stderr=FOREGROUND_LOG)
+        # -F keeps the reader in the foreground so stdout and stderr can be
+        # captured separately. No -d (debug) and no -l (lax) may be in effect:
+        # the diagnostics under test are the production defaults.
+        FOREGROUND_LOG_PATH = os.path.join(WORK, "foreground.log")
+        FOREGROUND_STDOUT_PATH = os.path.join(WORK, "foreground.stdout")
+        FOREGROUND_LOG = open(FOREGROUND_LOG_PATH, "wb")
+        FOREGROUND_STDOUT = open(FOREGROUND_STDOUT_PATH, "wb")
+        FOREGROUND = subprocess.Popen(PREFIX + [BIN, "-F"] + args[1:],
+                                      stdout=FOREGROUND_STDOUT,
+                                      stderr=FOREGROUND_LOG)
     else:
         subprocess.run(PREFIX + args, check=True)
     deadline = time.time() + 15
@@ -77,6 +110,8 @@ def mount(image, extra=(), foreground=False):
         try:
             if os.path.ismount(MNT):
                 os.listdir(MNT)
+                if foreground and FOREGROUND.poll() is not None:
+                    fail("foreground reader exited before the mount was ready")
                 return
             time.sleep(0.05)
         except OSError:
@@ -85,7 +120,7 @@ def mount(image, extra=(), foreground=False):
 
 
 def unmount():
-    global FOREGROUND, FOREGROUND_LOG
+    global FOREGROUND, FOREGROUND_LOG, FOREGROUND_STDOUT
     subprocess.run(PREFIX + [FUSERMOUNT, "-u", MNT], check=False,
                    stderr=subprocess.DEVNULL)
     time.sleep(0.1)
@@ -100,7 +135,8 @@ def unmount():
             if FOREGROUND is not None:
                 FOREGROUND.wait(timeout=10)
                 FOREGROUND_LOG.close()
-                FOREGROUND = FOREGROUND_LOG = None
+                FOREGROUND_STDOUT.close()
+                FOREGROUND = FOREGROUND_LOG = FOREGROUND_STDOUT = None
             return
         time.sleep(0.05)
     fail("unmount did not complete")
@@ -127,6 +163,61 @@ def expect_errno(call, expected, message):
             fail("%s: got errno %d, expected %d" % (message, exc.errno, expected))
         return
     fail("%s: call unexpectedly succeeded" % message)
+
+
+def read_log_window(path, start):
+    with open(path, "rb") as log:
+        log.seek(start)
+        return log.read()
+
+
+def parse_fields(line):
+    fields = {}
+    for token in line.split():
+        if b"=" in token:
+            key, value = token.split(b"=", 1)
+            fields[key] = value
+    return fields
+
+
+def object_records(window):
+    return [parse_fields(line) for line in window.splitlines()
+            if line.startswith(b"APFS_DECMPFS_OBJECT ")]
+
+
+def check_object_window(window, label):
+    """One complete OBJECT summary plus its one zlib block VALIDATION line."""
+    objects = object_records(window)
+    if len(objects) != 1:
+        fail("%s: expected one OBJECT line, got %d" % (label, len(objects)))
+    obj = objects[0]
+    missing = [field for field in OBJECT_FIELDS if field not in obj]
+    if missing:
+        fail("%s: OBJECT line missing fields %s" % (label, missing))
+    for key, value in HARDLINK_OBJECT.items():
+        if obj[key] != value:
+            fail("%s: OBJECT %s=%r, expected %r" %
+                 (label, key.decode(), obj[key], value))
+    lines = [line for line in window.splitlines()
+             if line.startswith(b"APFS_DECMPFS_VALIDATION ")]
+    if len(lines) != 1:
+        fail("%s: expected one VALIDATION line, got %d" % (label, len(lines)))
+    val = parse_fields(lines[0])
+    expected = {
+        b"seq": obj[b"seq"],
+        b"ino": b"60",
+        b"algo": b"4",
+        b"block": b"0",
+        b"expected": b"65536",
+        b"decoded": b"65536",
+        b"validation": b"length_with_checksum",
+        b"missing_adler": b"0",
+    }
+    for key, value in expected.items():
+        if val.get(key) != value:
+            fail("%s: VALIDATION %s=%r, expected %r" %
+                 (label, key.decode(), val.get(key), value))
+    return obj
 
 
 def check_rf_content(root, backup):
@@ -309,14 +400,66 @@ def test_bad():
 
 def test_foreground_log():
     mount(os.path.join(WORK, "good.img"), foreground=True)
+    log_path = FOREGROUND_LOG_PATH
+    root = os.path.join(MNT, "root")
+    first = os.path.join(root, "rf-zlib-1blk")
+    alias = os.path.join(root, HARDLINK_ALIAS)
     try:
+        # The two names are hardlinks: one inode, two paths. A manifest that
+        # opens every directory entry must see the same inode twice.
+        first_stat = os.stat(first)
+        alias_stat = os.stat(alias)
+        if first_stat.st_ino != 60 or alias_stat.st_ino != first_stat.st_ino:
+            fail("hardlink paths do not share FUSE inode 60: %d/%d" %
+                 (first_stat.st_ino, alias_stat.st_ino))
+
+        # First path: open and read the whole object, then compare the golden
+        # SHA. The open itself decompresses, so one OBJECT record is due.
+        size, digest = HARDLINK_GOLDEN
+        start = os.path.getsize(log_path)
+        with open(first, "rb") as f:
+            data = f.read()
+        first_object = check_object_window(
+            read_log_window(log_path, start), "first hardlink open/read")
+        if len(data) != size:
+            fail("rf-zlib-1blk size is %d, expected %d" % (len(data), size))
+        if hashlib.sha256(data).hexdigest() != digest:
+            fail("rf-zlib-1blk content SHA-256 mismatch")
+
+        # Second path: open and close without any read. The cached handle from
+        # the first path must not suppress decompression for the new open.
+        start = os.path.getsize(log_path)
+        fd = os.open(alias, os.O_RDONLY)
+        os.close(fd)
+        second_object = check_object_window(
+            read_log_window(log_path, start), "second hardlink open without read")
+        if int(second_object[b"seq"]) <= int(first_object[b"seq"]):
+            fail("second hardlink open must get a newer seq: %s -> %s" %
+                 (first_object[b"seq"].decode(), second_object[b"seq"].decode()))
+
+        # rf-missing is MissingCarrier: classification rejects it at open, so
+        # it must be EIO with no decompression error and no OBJECT record.
+        # The separate bad-carrier fixture is named "rf", not this one.
+        start = os.path.getsize(log_path)
+        expect_errno(lambda: os.open(os.path.join(root, "rf-missing"), os.O_RDONLY),
+                     errno.EIO, "rf-missing open")
+        window = read_log_window(log_path, start)
+        if b"APFS_DECMPFS_ERROR" in window:
+            fail("rf-missing must not emit APFS_DECMPFS_ERROR")
+        if object_records(window):
+            fail("rf-missing must not emit an OBJECT line")
+
         os.stat(os.path.join(MNT, "root", "unicode-\U0001f9e8"))
         # These opens must reach DecompressZLib() and fail closed; the FUSE
-        # process writes the diagnostic to the captured foreground log.
-        expect_damaged_zlib_eio(os.path.join(MNT, "root"))
+        # process writes the diagnostic to the captured stderr log.
+        expect_damaged_zlib_eio(root)
     finally:
         unmount()
-    with open(os.path.join(WORK, "foreground.log"), "rb") as log:
+
+    stdout_path = FOREGROUND_STDOUT_PATH
+    if os.path.getsize(stdout_path) != 0:
+        fail("foreground stdout must be empty without -d")
+    with open(log_path, "rb") as log:
         data = log.read()
     if b"APFS_UNICODE_FALLBACK" not in data or b"name_hex=756e69636f64652df09fa7a8" not in data:
         fail("foreground fallback log missing")

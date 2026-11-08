@@ -58,6 +58,10 @@ namespace
 	const uint32_t RF_STREAM_MAX_BLOCKS = 64;
 	const uint64_t RF_ZLIB_STREAM_OBJ = 0x3100;
 	const uint64_t RF_LZVN_STREAM_OBJ = 0x3101;
+	// Second directory entry for the compressed inode 60. Real manifests open
+	// every hardlink name, so the fixture must be able to model one inode with
+	// two paths without touching the reader's link handling.
+	const char *const RF_ZLIB_1BLK_ALIAS = "rf-zlib-1blk-hardlink";
 
 	// APFS stores xattr values above this size in a dstream, not embedded.
 	const size_t XATTR_EMBEDDED_MAX = 3802;
@@ -223,6 +227,7 @@ namespace
 		uint64_t parent;
 		uint64_t private_id;
 		uint16_t mode;
+		uint32_t nlink = 1;
 		uint32_t bsd_flags;
 		uint64_t internal_flags;
 		uint64_t uncompressed_size;
@@ -247,7 +252,7 @@ namespace
 		if ((spec.mode & MODE_S_IFMT) == MODE_S_IFDIR)
 			ino->nchildren = 2;
 		else
-			ino->nlink = 1;
+			ino->nlink = static_cast<int32_t>(spec.nlink);
 		ino->default_protection_class = 0;
 		ino->write_generation_counter = 0;
 		ino->bsd_flags = spec.bsd_flags;
@@ -1191,7 +1196,7 @@ namespace
 	// single-block carriers stay embedded; the multi-block carriers are stored
 	// as dstreams, like a real large resource fork.
 	bool AddRfContentRecords(std::vector<KeyVal> &entries,
-		std::vector<RfCarrierWrite> &writes, std::string &error)
+		std::vector<RfCarrierWrite> &writes, bool hardlink_alias, std::string &error)
 	{
 		struct Case
 		{
@@ -1223,9 +1228,18 @@ namespace
 
 			const uint64_t size = RfContentSize(c.kind);
 
+			InodeSpec inode = FileInode(c.ino, c.name, 0, 0, APFS_UF_COMPRESSED,
+				INODE_HAS_UNCOMPRESSED_SIZE, size);
+			if (hardlink_alias && c.ino == 60)
+			{
+				// The compressed single-block file is also the hardlink fixture:
+				// two names, one inode, nlink 2.
+				inode.nlink = 2;
+				AddDrec(entries, 2, RF_ZLIB_1BLK_ALIAS, c.ino, DT_REG);
+			}
+
 			AddDrec(entries, 2, c.name, c.ino, DT_REG);
-			AddInode(entries, FileInode(c.ino, c.name, 0, 0, APFS_UF_COMPRESSED,
-				INODE_HAS_UNCOMPRESSED_SIZE, size));
+			AddInode(entries, inode);
 			AddEmbeddedXattr(entries, c.ino, "com.apple.decmpfs",
 				MakeDecmpfs(c.algo, size, false));
 
@@ -1706,7 +1720,7 @@ namespace
 	}
 
 	bool AddGoodRecords(std::vector<KeyVal> &entries,
-		std::vector<RfCarrierWrite> &writes, std::string &error)
+		std::vector<RfCarrierWrite> &writes, bool hardlink_alias, std::string &error)
 	{
 		AddBaseInodes(entries);
 
@@ -1792,7 +1806,7 @@ namespace
 
 		// Valid resource-fork compressed content (inode 26 above stays the
 		// deliberate invalid-carrier negative case).
-		if (!AddRfContentRecords(entries, writes, error))
+		if (!AddRfContentRecords(entries, writes, hardlink_alias, error))
 			return false;
 		if (!AddMissingAdlerRecord(entries, error))
 			return false;
@@ -1803,7 +1817,7 @@ namespace
 	bool AddBadRecords(std::vector<KeyVal> &entries,
 		std::vector<RfCarrierWrite> &writes, std::string &error)
 	{
-		if (!AddGoodRecords(entries, writes, error))
+		if (!AddGoodRecords(entries, writes, false, error))
 			return false;
 
 		// High keys routed to the damaged last leaf.
@@ -2119,7 +2133,10 @@ bool CreateApfsFixture(const std::string &path, ApfsFixtureKind kind, std::strin
 	switch (kind)
 	{
 	case ApfsFixtureKind::Good:
-		if (!AddGoodRecords(entries, rf_writes, error))
+		// The hardlink alias is only needed in the good image. Adding it to
+		// the bad tree would shift the leaf groups that test deliberately
+		// corrupts.
+		if (!AddGoodRecords(entries, rf_writes, true, error))
 			return false;
 		// Malformed-carrier cases live only in the good image so they do not
 		// shift the high keys that the BadTree image deliberately corrupts.
