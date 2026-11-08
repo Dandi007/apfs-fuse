@@ -15,12 +15,14 @@
 #include "Crypto/Sha256.h"
 
 #include <chrono>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <unistd.h>
@@ -75,6 +77,9 @@ static void TestResourceForkContent(ApfsDir &dir);
 static void TestMissingAdlerDiagnostics(ApfsDir &dir, const std::string &image_path);
 static void TestRfBoundsRejects(ApfsDir &dir, const std::string &image_path);
 static void TestInlineZlibContent(ApfsDir &dir, const std::string &image_path);
+static void TestObjectDiagnostics(ApfsDir &dir, const std::string &image_path);
+static void TestConcurrentObjectLogs(const std::string &image_path);
+static size_t CountOccurrences(const std::string &text, const std::string &needle);
 
 // Captures std::cerr for one call so the test can assert the zlib failure
 // diagnostic without flooding the normal test output.
@@ -90,6 +95,105 @@ private:
 	std::ostringstream m_buffer;
 	std::streambuf *m_old;
 };
+
+static std::string FindDiagnosticLine(const std::string &log, const std::string &kind)
+{
+	const std::string needle = kind + " ";
+	std::string found;
+	size_t pos = 0;
+
+	while ((pos = log.find(needle, pos)) != std::string::npos)
+	{
+		const size_t end = log.find('\n', pos);
+		require(found.empty(), "multiple " + kind + " lines");
+		found = log.substr(pos, end == std::string::npos ?
+			std::string::npos : end - pos);
+		pos = end == std::string::npos ? log.size() : end;
+	}
+
+	require(!found.empty(), "missing " + kind + " line");
+	return found;
+}
+
+static std::string LineField(const std::string &line, const std::string &name)
+{
+	const std::string key = name + "=";
+	const size_t pos = line.find(key);
+	require(pos != std::string::npos, "missing field " + name + " in: " + line);
+	const size_t begin = pos + key.size();
+	const size_t end = line.find_first_of(" \n", begin);
+	return line.substr(begin, end == std::string::npos ?
+		std::string::npos : end - begin);
+}
+
+static uint64_t LineU64(const std::string &line, const std::string &name)
+{
+	return std::strtoull(LineField(line, name).c_str(), nullptr, 10);
+}
+
+static void CheckResultCleared(const DecompressResult &result,
+	const std::string &label)
+{
+	require(result.seq == 0 && result.logical_size == 0 &&
+		result.block_count == 0 && result.zlib_block_count == 0 &&
+		result.raw_block_count == 0 && result.native_block_count == 0 &&
+		result.missing_adler_block_count == 0 &&
+		!result.accepted_missing_adler && !result.checksum_verified,
+		label + ": failure must clear every result field");
+}
+
+// Assert the fixed object-level contract for one successful decode: exactly
+// one summary, matching result metadata, consistent block accounting, one
+// validation line per zlib block, and a checksum claim only when every block
+// was zlib with its Adler-32 trailer.
+static void CheckObjectSummary(const std::string &log,
+	const DecompressResult &result, const std::string &label)
+{
+	require(CountOccurrences(log, "APFS_DECMPFS_ERROR") == 0,
+		label + ": success logged an error");
+	const std::string line = FindDiagnosticLine(log, "APFS_DECMPFS_OBJECT");
+
+	require(result.seq != 0 && LineU64(line, "seq") == result.seq,
+		label + ": object seq does not match result");
+	require(LineU64(line, "logical_size") == result.logical_size,
+		label + ": logical_size");
+	require(LineU64(line, "blocks") == result.block_count, label + ": blocks");
+	require(LineU64(line, "zlib") == result.zlib_block_count, label + ": zlib");
+	require(LineU64(line, "raw") == result.raw_block_count, label + ": raw");
+	require(LineU64(line, "native") == result.native_block_count,
+		label + ": native");
+	require(LineU64(line, "missing_adler") ==
+		result.missing_adler_block_count, label + ": missing_adler");
+	require(CountOccurrences(log, "APFS_DECMPFS_VALIDATION") ==
+		result.zlib_block_count, label + ": validation line count");
+
+	require(result.block_count == result.zlib_block_count +
+		result.raw_block_count + result.native_block_count,
+		label + ": blocks != zlib + raw + native");
+
+	const bool checksum_verified = result.block_count > 0 &&
+		result.zlib_block_count == result.block_count &&
+		result.missing_adler_block_count == 0;
+	require(result.checksum_verified == checksum_verified,
+		label + ": result checksum flag");
+	require(LineU64(line, "checksum_verified") ==
+		(checksum_verified ? 1u : 0u), label + ": object checksum flag");
+
+	const std::string expected_validation = result.block_count == 0 ? "empty" :
+		(checksum_verified ? "checksum" : "structure_length_only");
+	require(LineField(line, "validation") == expected_validation,
+		label + ": validation class");
+	require(LineField(line, "result") == "ok", label + ": result field");
+}
+
+static void CheckNoObjectOrValidation(const std::string &log,
+	const std::string &label)
+{
+	require(log.find("APFS_DECMPFS_OBJECT") == std::string::npos,
+		label + ": failure must not emit an object summary");
+	require(log.find("APFS_DECMPFS_VALIDATION") == std::string::npos,
+		label + ": failure must not emit a validation line");
+}
 
 struct Image
 {
@@ -240,6 +344,7 @@ static void TestGoodImage(const std::string &path)
 	TestMissingAdlerDiagnostics(dir, path);
 	TestRfBoundsRejects(dir, path);
 	TestInlineZlibContent(dir, path);
+	TestObjectDiagnostics(dir, path);
 }
 
 static void TestResourceForkContent(ApfsDir &dir)
@@ -398,6 +503,7 @@ static void TestMissingAdlerDiagnostics(ApfsDir &dir, const std::string &image_p
 		}
 
 		require(ok, std::string(item.name) + ": DecompressFile");
+		CheckObjectSummary(log, result, item.name);
 		require(result.zlib_block_count == item.lines,
 			std::string(item.name) + ": zlib block count");
 		require(result.missing_adler_block_count ==
@@ -443,6 +549,7 @@ static void TestMissingAdlerDiagnostics(ApfsDir &dir, const std::string &image_p
 		DecompressResult result;
 		CerrCapture capture;
 		require(DecompressFile(dir, 91, decoded, attr, &result), "canonical mixed decode");
+		CheckObjectSummary(capture.str(), result, "canonical mixed decode");
 		FillRfContent(expected, RfContentKind::ZlibSingle);
 		auto tail = std::vector<uint8_t>(expected.begin(), expected.begin() + 12345);
 		expected.insert(expected.end(), tail.begin(), tail.end());
@@ -462,10 +569,18 @@ static void TestMissingAdlerDiagnostics(ApfsDir &dir, const std::string &image_p
 			DecompressResult result;
 			result.accepted_missing_adler = true;
 			result.zlib_block_count = result.missing_adler_block_count = 7;
-			require(DecompressFile(dir, 80, decoded, attr, &result), "empty supported algorithm");
+			std::string log;
+			bool ok = false;
+			{
+				CerrCapture capture;
+				ok = DecompressFile(dir, 80, decoded, attr, &result);
+				log = capture.str();
+			}
+			require(ok, "empty supported algorithm");
 			require(decoded.empty() && !result.accepted_missing_adler &&
 				result.zlib_block_count == 0 && result.missing_adler_block_count == 0,
 				"empty output and metadata reset");
+			CheckObjectSummary(log, result, "empty supported algorithm");
 		}
 	}
 
@@ -507,6 +622,7 @@ static void TestRfBoundsRejects(ApfsDir &dir, const std::string &image_path)
 		{89, "rf-bad-raw14-length", 14, "block", "raw_marker_length"},
 		{90, "rf-bad-partial-decode", 4, "block", "block_marker"},
 		{92, "rf-bad-map-block", 4, "rsrc_table", "block_size"},
+		{94, "rf-bad-data-size-beyond", 4, "rsrc_table", "data_size"},
 	};
 
 	IoStatus st = IoStatus::Ok;
@@ -538,6 +654,12 @@ static void TestRfBoundsRejects(ApfsDir &dir, const std::string &image_path)
 		require(decoded.empty(), label + ": stale output retained");
 		require(result.zlib_block_count == 0 && result.missing_adler_block_count == 0 &&
 			!result.accepted_missing_adler, label + ": failure must not report success");
+		CheckResultCleared(result, label);
+		CheckNoObjectOrValidation(log, label);
+		require(CountOccurrences(log, "APFS_DECMPFS_ERROR") == 1,
+			label + ": expected exactly one error diagnostic");
+		const std::string error = FindDiagnosticLine(log, "APFS_DECMPFS_ERROR");
+		require(LineU64(error, "seq") != 0, label + ": error has no seq");
 		require(log.find("APFS_DECMPFS_ERROR") != std::string::npos,
 			label + ": missing error diagnostic");
 		require(log.find("APFS_DECMPFS_VALIDATION") == std::string::npos,
@@ -683,6 +805,433 @@ static void TestInlineZlibContent(ApfsDir &dir, const std::string &image_path)
 				<< " us with bounded diagnostic" << std::endl;
 		}
 	}
+}
+
+// Pre-fill every field so a success path has to overwrite it and a failure
+// path has to clear it.
+static DecompressResult DirtyResult()
+{
+	DecompressResult result;
+	result.accepted_missing_adler = true;
+	result.zlib_block_count = 91;
+	result.missing_adler_block_count = 92;
+	result.seq = 93;
+	result.logical_size = 94;
+	result.block_count = 95;
+	result.raw_block_count = 96;
+	result.native_block_count = 97;
+	result.checksum_verified = true;
+	return result;
+}
+
+static void TestObjectDiagnostics(ApfsDir &dir, const std::string &image_path)
+{
+	IoStatus st = IoStatus::Ok;
+
+	struct Case
+	{
+		uint64_t ino;
+		const char *name;
+		size_t blocks;
+		size_t zlib;
+		size_t raw;
+		size_t native;
+		size_t missing;
+		bool checksum;
+	};
+
+	const Case cases[] = {
+		{60, "rf-zlib-1blk", 1, 1, 0, 0, 0, true},
+		{61, "rf-zlib-multi", 3, 3, 0, 0, 0, true},
+		{62, "rf-lzvn-1blk", 1, 0, 0, 1, 0, false},
+		{63, "rf-lzvn-multi", 3, 0, 0, 3, 0, false},
+		{64, "inline-zlib", 1, 1, 0, 0, 0, true},
+		{67, "rf-zlib-no-adler", 1, 1, 0, 0, 1, false},
+		{91, "rf-canonical-mixed", 2, 2, 0, 0, 1, false},
+		{93, "rf-mixed-zlib-raw", 2, 1, 1, 0, 0, false},
+	};
+
+	for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++)
+	{
+		const Case &item = cases[c];
+		const std::string label = item.name;
+
+		std::vector<uint8_t> decmpfs;
+		require(dir.GetAttribute(decmpfs, item.ino, "com.apple.decmpfs", &st) &&
+			st == IoStatus::Ok, label + ": decmpfs read");
+
+		DecompressResult result = DirtyResult();
+		std::vector<uint8_t> decoded(32, 0xAB);
+		std::string log;
+		bool ok = false;
+
+		{
+			CerrCapture capture;
+			ok = DecompressFile(dir, item.ino, decoded, decmpfs, &result);
+			log = capture.str();
+		}
+
+		require(ok, label + ": DecompressFile");
+		require(result.logical_size == decoded.size(),
+			label + ": logical size does not match output");
+		require(result.block_count == item.blocks &&
+			result.zlib_block_count == item.zlib &&
+			result.raw_block_count == item.raw &&
+			result.native_block_count == item.native &&
+			result.missing_adler_block_count == item.missing &&
+			result.checksum_verified == item.checksum,
+			label + ": result counts");
+		CheckObjectSummary(log, result, label);
+		require(log.find(image_path) == std::string::npos,
+			label + ": diagnostic leaks the image path");
+		require(log.find(item.name) == std::string::npos,
+			label + ": diagnostic leaks the file name");
+
+		if (item.ino == 93)
+		{
+			// Independent expected content: one 64 KiB block plus the first
+			// 123 plaintext bytes carried by the raw marker.
+			std::vector<uint8_t> expected;
+			FillRfContent(expected, RfContentKind::ZlibSingle);
+			std::vector<uint8_t> tail(expected.begin(), expected.begin() + 123);
+			expected.insert(expected.end(), tail.begin(), tail.end());
+			requireBytes(decoded, expected, label + ": mixed content");
+		}
+	}
+
+	// Zero-length objects still have to prove they were opened, but must
+	// never claim a checksum. Output and result are dirtied first.
+	{
+		std::vector<uint8_t> decmpfs;
+		require(dir.GetAttribute(decmpfs, 80, "com.apple.decmpfs", &st),
+			"empty object: decmpfs read");
+		DecompressResult result = DirtyResult();
+		std::vector<uint8_t> decoded(32, 0xAB);
+		std::string log;
+		bool ok = false;
+
+		{
+			CerrCapture capture;
+			ok = DecompressFile(dir, 80, decoded, decmpfs, &result);
+			log = capture.str();
+		}
+
+		require(ok, "empty object: DecompressFile");
+		require(decoded.empty(), "empty object: output not cleared");
+		require(result.seq != 0 && result.logical_size == 0 &&
+			result.block_count == 0 && result.zlib_block_count == 0 &&
+			result.raw_block_count == 0 && result.native_block_count == 0 &&
+			result.missing_adler_block_count == 0 &&
+			!result.accepted_missing_adler && !result.checksum_verified,
+			"empty object: result not reset");
+		CheckObjectSummary(log, result, "empty object");
+	}
+
+	// Consecutive calls get strictly increasing seq values.
+	{
+		std::vector<uint8_t> decmpfs;
+		require(dir.GetAttribute(decmpfs, 80, "com.apple.decmpfs", &st),
+			"seq sequence: decmpfs read");
+		uint64_t previous = 0;
+
+		for (size_t i = 0; i < 32; i++)
+		{
+			DecompressResult result;
+			std::vector<uint8_t> decoded(8, 0xAA);
+			std::string log;
+			bool ok = false;
+
+			{
+				CerrCapture capture;
+				ok = DecompressFile(dir, 80, decoded, decmpfs, &result);
+				log = capture.str();
+			}
+
+			require(ok && decoded.empty(), "seq sequence: empty decode");
+			if (i == 0)
+				previous = result.seq;
+			else
+			{
+				require(result.seq == previous + 1,
+					"seq sequence: not strictly increasing");
+				previous = result.seq;
+			}
+			CheckObjectSummary(log, result, "seq sequence");
+		}
+	}
+
+	// The same ino opened twice is two independent attempts with two seqs.
+	{
+		std::vector<uint8_t> decmpfs;
+		require(dir.GetAttribute(decmpfs, 67, "com.apple.decmpfs", &st),
+			"duplicate ino: decmpfs read");
+		uint64_t seqs[2] = { 0, 0 };
+
+		for (size_t pass = 0; pass < 2; pass++)
+		{
+			DecompressResult result;
+			std::vector<uint8_t> decoded;
+			std::string log;
+			bool ok = false;
+
+			{
+				CerrCapture capture;
+				ok = DecompressFile(dir, 67, decoded, decmpfs, &result);
+				log = capture.str();
+			}
+
+			require(ok, "duplicate ino: decode");
+			CheckObjectSummary(log, result, "duplicate ino");
+			seqs[pass] = result.seq;
+		}
+
+		require(seqs[0] != 0 && seqs[1] != 0 && seqs[0] != seqs[1],
+			"duplicate ino must produce two distinct seq values");
+	}
+
+	// A zero-length object with an unknown algorithm is still a failure, and
+	// uses the same stage/reason as the non-empty unknown-algorithm path.
+	{
+		std::vector<uint8_t> decmpfs;
+		require(dir.GetAttribute(decmpfs, 80, "com.apple.decmpfs", &st),
+			"zero-size unknown: decmpfs read");
+
+		const uint32_t unknown_algos[] = { 2, 99 };
+		for (size_t a = 0; a < sizeof(unknown_algos) / sizeof(unknown_algos[0]); a++)
+		{
+			const uint32_t algo = unknown_algos[a];
+			for (size_t j = 0; j < 4; j++)
+				decmpfs[4 + j] = static_cast<uint8_t>((algo >> (8 * j)) & 0xFF);
+
+			const std::string label = "zero-size unknown algo " +
+				std::to_string(algo);
+			DecompressResult result = DirtyResult();
+			std::vector<uint8_t> decoded(16, 0xAA);
+			std::string log;
+			bool ok = true;
+
+			{
+				CerrCapture capture;
+				ok = DecompressFile(dir, 80, decoded, decmpfs, &result);
+				log = capture.str();
+			}
+
+			require(!ok, label + ": must fail");
+			require(decoded.empty(), label + ": output not cleared");
+			CheckResultCleared(result, label);
+			CheckNoObjectOrValidation(log, label);
+			require(CountOccurrences(log, "APFS_DECMPFS_ERROR") == 1,
+				label + ": expected exactly one error line");
+			const std::string error = FindDiagnosticLine(log,
+				"APFS_DECMPFS_ERROR");
+			require(LineU64(error, "seq") != 0, label + ": error has no seq");
+			require(LineU64(error, "algo") == algo, label + ": error algo");
+			require(LineField(error, "stage") == "algorithm",
+				label + ": error stage");
+			require(LineField(error, "reason") == "unsupported",
+				label + ": error reason");
+		}
+	}
+
+	// A valid first block followed by a bad second block: no successful
+	// block line and no object summary may survive the failure.
+	{
+		std::vector<uint8_t> decmpfs;
+		require(dir.GetAttribute(decmpfs, 90, "com.apple.decmpfs", &st),
+			"second-block failure: decmpfs read");
+		DecompressResult result = DirtyResult();
+		std::vector<uint8_t> decoded(32, 0xAB);
+		std::string log;
+		bool ok = true;
+
+		{
+			CerrCapture capture;
+			ok = DecompressFile(dir, 90, decoded, decmpfs, &result);
+			log = capture.str();
+		}
+
+		require(!ok, "second-block failure: must fail");
+		require(decoded.empty(), "second-block failure: output not cleared");
+		CheckResultCleared(result, "second-block failure");
+		CheckNoObjectOrValidation(log, "second-block failure");
+		const std::string error = FindDiagnosticLine(log, "APFS_DECMPFS_ERROR");
+		require(LineU64(error, "seq") != 0, "second-block failure: error seq");
+		require(LineU64(error, "ino") == 90, "second-block failure: error ino");
+		require(LineU64(error, "algo") == 4, "second-block failure: error algo");
+		require(LineU64(error, "block") == 1,
+			"second-block failure: error block index");
+		require(LineField(error, "stage") == "block",
+			"second-block failure: error stage");
+		require(LineField(error, "reason") == "block_marker",
+			"second-block failure: error reason");
+	}
+
+	TestConcurrentObjectLogs(image_path);
+}
+
+// Multiple threads decode independent objects from independent image
+// instances. Every object's lines must stay contiguous, because the whole
+// success log (validation lines plus summary) is published in one write.
+static void TestConcurrentObjectLogs(const std::string &image_path)
+{
+	struct Spec
+	{
+		uint64_t ino;
+		size_t zlib;
+		size_t blocks;
+	};
+
+	const Spec specs[] = {
+		{60, 1, 1},
+		{61, 3, 3},
+		{67, 1, 1},
+		{91, 2, 2},
+		{93, 1, 2},
+	};
+	const size_t count = sizeof(specs) / sizeof(specs[0]);
+
+	std::vector<Image *> images(count, nullptr);
+	for (size_t i = 0; i < count; i++)
+	{
+		images[i] = new Image();
+		std::string error;
+		require(OpenImage(image_path, *images[i], error),
+			"concurrent: open image: " + error);
+	}
+
+	std::vector<bool> ok(count, false);
+	std::vector<DecompressResult> results(count);
+	std::vector<std::string> errors(count);
+	std::string log;
+
+	{
+		CerrCapture capture;
+		std::vector<std::thread> threads;
+
+		for (size_t i = 0; i < count; i++)
+		{
+			threads.push_back(std::thread([&, i]() {
+				try
+				{
+					IoStatus st = IoStatus::Ok;
+					std::vector<uint8_t> attr;
+					if (!images[i]->dir->GetAttribute(attr, specs[i].ino,
+						"com.apple.decmpfs", &st))
+					{
+						errors[i] = "decmpfs attribute read";
+						return;
+					}
+					std::vector<uint8_t> decoded;
+					ok[i] = DecompressFile(*images[i]->dir, specs[i].ino,
+						decoded, attr, &results[i]);
+					if (!ok[i])
+						errors[i] = "DecompressFile";
+				}
+				catch (const std::exception &e)
+				{
+					errors[i] = e.what();
+				}
+				catch (...)
+				{
+					errors[i] = "unknown exception";
+				}
+			}));
+		}
+
+		for (size_t i = 0; i < threads.size(); i++)
+			threads[i].join();
+		log = capture.str();
+	}
+
+	for (size_t i = 0; i < count; i++)
+	{
+		require(ok[i], "concurrent object " + std::to_string(specs[i].ino) +
+			": " + errors[i]);
+	}
+
+	std::vector<std::string> lines;
+	size_t begin = 0;
+	while (begin < log.size())
+	{
+		const size_t end = log.find('\n', begin);
+		lines.push_back(log.substr(begin, end == std::string::npos ?
+			std::string::npos : end - begin));
+		if (end == std::string::npos)
+			break;
+		begin = end + 1;
+	}
+
+	std::vector<uint64_t> group_seqs;
+	std::vector<std::string> group_logs;
+	uint64_t current = 0;
+
+	for (size_t i = 0; i < lines.size(); i++)
+	{
+		require(lines[i].empty() ||
+			lines[i].compare(0, 13, "APFS_DECMPFS_") == 0,
+			"concurrent: unexpected diagnostic line: " + lines[i]);
+		if (lines[i].empty())
+			continue;
+
+		const uint64_t seq = LineU64(lines[i], "seq");
+		if (seq != current)
+		{
+			for (size_t g = 0; g < group_seqs.size(); g++)
+				require(group_seqs[g] != seq,
+					"concurrent: seq " + std::to_string(seq) +
+					" appears in more than one contiguous block");
+			current = seq;
+			group_seqs.push_back(seq);
+			group_logs.push_back(std::string());
+		}
+		group_logs.back() += lines[i] + "\n";
+	}
+
+	require(group_seqs.size() == count,
+		"concurrent: expected one diagnostic block per object");
+
+	std::vector<uint64_t> seen_inos;
+	for (size_t g = 0; g < group_logs.size(); g++)
+	{
+		const std::string &block = group_logs[g];
+		const std::string object = FindDiagnosticLine(block,
+			"APFS_DECMPFS_OBJECT");
+		const uint64_t ino = LineU64(object, "ino");
+		const size_t zlib = static_cast<size_t>(LineU64(object, "zlib"));
+		const size_t blocks = static_cast<size_t>(LineU64(object, "blocks"));
+
+		require(CountOccurrences(block, "APFS_DECMPFS_VALIDATION") == zlib,
+			"concurrent: validation lines do not match zlib count");
+		require(CountOccurrences(block, "APFS_DECMPFS_") == zlib + 1,
+			"concurrent: object block has extra lines");
+		require(LineU64(object, "seq") == group_seqs[g],
+			"concurrent: seq mismatch inside object block");
+		require(std::find(seen_inos.begin(), seen_inos.end(), ino) ==
+			seen_inos.end(), "concurrent: duplicate ino " +
+			std::to_string(ino));
+		seen_inos.push_back(ino);
+
+		bool matched = false;
+		for (size_t s = 0; s < count; s++)
+		{
+			if (specs[s].ino != ino)
+				continue;
+			matched = true;
+			require(blocks == specs[s].blocks && zlib == specs[s].zlib,
+				"concurrent: object counts for ino " + std::to_string(ino));
+			require(results[s].seq == group_seqs[g],
+				"concurrent: result seq does not match object line");
+		}
+		require(matched, "concurrent: unexpected ino " + std::to_string(ino));
+	}
+
+	for (size_t i = 0; i < count; i++)
+		require(std::find(seen_inos.begin(), seen_inos.end(), specs[i].ino) !=
+			seen_inos.end(), "concurrent: missing ino " +
+			std::to_string(specs[i].ino));
+
+	for (size_t i = 0; i < images.size(); i++)
+		delete images[i];
 }
 
 static void TestBadImage(const std::string &path)

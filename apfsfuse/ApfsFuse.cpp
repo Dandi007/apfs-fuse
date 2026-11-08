@@ -80,6 +80,7 @@ static int g_physblksize = 512;
 static std::string g_password;
 static xid_t g_snap_xid = 0;
 static bool g_backup_view = false;
+static bool g_foreground = false;
 static uint64_t g_max_decomp_size = 0;
 
 static const char *const DECMPFS_XATTR = "com.apple.decmpfs";
@@ -864,6 +865,9 @@ void usage(const char *name)
 	std::cout << "Options:" << std::endl;
 	std::cout << "-d level      : Enable debug output in the console." << std::endl;
 	std::cout << "-f device     : Specify secondary device for fusion drives." << std::endl;
+	std::cout << "-F            : Stay in the foreground; do not daemonize. This does not" << std::endl;
+	std::cout << "                enable debug output and leaves stderr available to the" << std::endl;
+	std::cout << "                wrapper (for example a dedicated reader.log file)." << std::endl;
 	std::cout << "-o options    : Additional mount options (see below)." << std::endl;
 	std::cout << "-v volume-id  : Specify number of volume to be mounted." << std::endl;
 	std::cout << "-r passphrase : Specify volume passphrase. The driver will ask for it if it is" << std::endl;
@@ -1016,7 +1020,7 @@ int main(int argc, char *argv[])
 	g_set_uid = false;
 	g_set_gid = false;
 
-	while ((opt = getopt(argc, argv, "d:f:o:p:v:r:s:l")) != -1)
+	while ((opt = getopt(argc, argv, "d:f:Fo:p:v:r:s:l")) != -1)
 	{
 		switch (opt)
 		{
@@ -1025,6 +1029,9 @@ int main(int argc, char *argv[])
 				break;
 			case 'f':
 				tier2_dev_path = optarg;
+				break;
+			case 'F':
+				g_foreground = true;
 				break;
 			case 'o':
 				add_option(mount_options, optarg, nullptr);
@@ -1176,7 +1183,7 @@ int main(int argc, char *argv[])
 		{
 			if (fuse_set_signal_handlers(se) != -1)
 			{
-				if (g_debug == 0)
+				if (g_debug == 0 && !g_foreground)
 					fuse_daemonize(0);
 				fuse_session_add_chan(se, ch);
 				err = fuse_session_loop(se);
@@ -1195,7 +1202,7 @@ int main(int argc, char *argv[])
 		{
 			if (fuse_session_mount(se, mountpoint) == 0)
 			{
-				if (g_debug == 0)
+				if (g_debug == 0 && !g_foreground)
 					fuse_daemonize(0);
 
 				err = fuse_session_loop(se);

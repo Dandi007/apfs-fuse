@@ -69,3 +69,5 @@ APFS_DECMPFS_ERROR ino=70 algo=4 block=0 stage=rsrc_table reason=block_count
 新增canonical type4布局：BE前缀等于data_size-4，完整压缩数据之后有独立50字节resource map；两块分别带/不带Adler，中间表后padding合法。对照反例把第二块指向物理上存在的map字节，必须拒绝。所有畸形载体测试预置非空输出及非零result，失败后清空。
 
 本PR的逐块日志还不是完整诊断协议。真实重放前须另PR增加对象汇总（blocks/zlib/raw/missing_adler/seq）并对接manifest：缺汇总对象为unknown，不能把没有缺Adler行等价为有checksum。日志必须由独立前台实例写入attempt专属0600文件，禁止daemon模式丢弃stderr。现有-d部分位会输出名字或字节，需确定不启用调试泄露的前台运行方式并在非root合成FUSE实测落盘，当前不能把这一前置称为通过。生产reader不变。
+
+后续 `docs/decmpfs-object-diagnostics.md` 已实现对象汇总、seq 与 `-F` 前台选项；非 root 合成 FUSE 的落盘实测与 manifest 对接仍不在本文 PR 内。

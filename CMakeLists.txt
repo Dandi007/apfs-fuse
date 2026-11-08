@@ -152,6 +152,8 @@ install(TARGETS apfsutil RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
 
 include(CTest)
 if (BUILD_TESTING)
+  find_package(Threads REQUIRED)
+
   add_executable(btree-offset-test tests/BTreeOffsetTest.cpp)
   target_link_libraries(btree-offset-test apfs)
   add_test(NAME btree-offset COMMAND btree-offset-test)
@@ -173,7 +175,7 @@ if (BUILD_TESTING)
   target_link_libraries(apfs-fixture apfs lzfse z)
 
   add_executable(reader-integration-test tests/ApfsReaderIntegrationTest.cpp)
-  target_link_libraries(reader-integration-test apfs apfs-fixture)
+  target_link_libraries(reader-integration-test apfs apfs-fixture ${CMAKE_THREAD_LIBS_INIT})
   add_test(NAME reader-integration COMMAND reader-integration-test)
   set_tests_properties(reader-integration PROPERTIES SKIP_RETURN_CODE 77)
 
@@ -183,6 +185,9 @@ if (BUILD_TESTING)
   add_test(NAME reader-fuse COMMAND sh ${CMAKE_SOURCE_DIR}/tests/reader-fuse.sh
     $<TARGET_FILE:apfs-fuse> $<TARGET_FILE:apfs-fixture-gen>)
   set_tests_properties(reader-fuse PROPERTIES SKIP_RETURN_CODE 77)
+
+  add_test(NAME foreground-option COMMAND sh ${CMAKE_SOURCE_DIR}/tests/foreground-option.sh
+    $<TARGET_FILE:apfs-fuse>)
 
   add_test(NAME lookup-generation COMMAND sh ${CMAKE_SOURCE_DIR}/tests/lookup-generation.sh $<TARGET_FILE:apfs-fuse>)
   set_tests_properties(lookup-generation PROPERTIES SKIP_RETURN_CODE 77)

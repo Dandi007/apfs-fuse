@@ -18,11 +18,13 @@
 */
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <new>
 #include <stdexcept>
 #include <string>
@@ -64,41 +66,80 @@ uint32_t ReadLE32(const uint8_t *p)
 		(static_cast<uint32_t>(p[3]) << 24);
 }
 
-void EmitLine(const std::string &line)
+std::atomic<uint64_t> g_decompress_seq(0);
+
+std::mutex &DiagnosticMutex()
 {
-	if (line.empty())
-		return;
-	std::cerr.write(line.data(), static_cast<std::streamsize>(line.size()));
-	std::cerr.flush();
+	static std::mutex mutex;
+	return mutex;
 }
 
 // Diagnostics are built completely before one write so a line cannot be
 // interleaved with another thread's output. Only stable identity and sizes
 // are printed: never a file name, path or payload byte.
-void EmitError(uint64_t ino, uint32_t algo, size_t block, const char *stage,
-	const char *reason)
+void EmitBlob(const std::string &blob)
 {
-	char line[256];
+	if (blob.empty())
+		return;
+
+	std::lock_guard<std::mutex> lock(DiagnosticMutex());
+	std::cerr.write(blob.data(), static_cast<std::streamsize>(blob.size()));
+	std::cerr.flush();
+}
+
+void EmitError(uint64_t seq, uint64_t ino, uint32_t algo, size_t block,
+	const char *stage, const char *reason)
+{
+	char line[320];
 	const int n = std::snprintf(line, sizeof(line),
-		"APFS_DECMPFS_ERROR ino=%llu algo=%u block=%zu stage=%s reason=%s\n",
+		"APFS_DECMPFS_ERROR seq=%llu ino=%llu algo=%u block=%zu stage=%s reason=%s\n",
+		static_cast<unsigned long long>(seq),
 		static_cast<unsigned long long>(ino), algo, block, stage, reason);
 	if (n <= 0)
 		return;
 	const size_t len = std::min(sizeof(line) - 1, static_cast<size_t>(n));
+
+	std::lock_guard<std::mutex> lock(DiagnosticMutex());
 	std::cerr.write(line, static_cast<std::streamsize>(len));
 	std::cerr.flush();
 }
 
-std::string FormatValidation(uint64_t ino, uint32_t algo, size_t block,
-	size_t compressed, size_t expected, size_t decoded, bool missing_adler)
+std::string FormatValidation(uint64_t seq, uint64_t ino, uint32_t algo,
+	size_t block, size_t compressed, size_t expected, size_t decoded,
+	bool missing_adler)
 {
-	char line[320];
+	char line[384];
 	const int n = std::snprintf(line, sizeof(line),
-		"APFS_DECMPFS_VALIDATION ino=%llu algo=%u block=%zu compressed=%zu"
-		" expected=%zu decoded=%zu validation=%s missing_adler=%u\n",
+		"APFS_DECMPFS_VALIDATION seq=%llu ino=%llu algo=%u block=%zu"
+		" compressed=%zu expected=%zu decoded=%zu validation=%s missing_adler=%u\n",
+		static_cast<unsigned long long>(seq),
 		static_cast<unsigned long long>(ino), algo, block, compressed, expected,
 		decoded, missing_adler ? "structure_length_only" : "length_with_checksum",
 		missing_adler ? 1u : 0u);
+	if (n <= 0)
+		return std::string();
+	const size_t len = std::min(sizeof(line) - 1, static_cast<size_t>(n));
+	return std::string(line, len);
+}
+
+// One summary per successful DecompressFile call. zlib/raw/native are the
+// number of blocks accepted through each path, so a raw or native-format
+// object can never be mistaken for checksum-verified output.
+std::string FormatObject(uint64_t seq, uint64_t ino, uint32_t algo,
+	uint64_t logical_size, size_t blocks, size_t zlib, size_t raw,
+	size_t native, size_t missing_adler, bool checksum_verified)
+{
+	const char *validation = blocks == 0 ? "empty" :
+		(checksum_verified ? "checksum" : "structure_length_only");
+	char line[448];
+	const int n = std::snprintf(line, sizeof(line),
+		"APFS_DECMPFS_OBJECT seq=%llu ino=%llu algo=%u logical_size=%llu"
+		" blocks=%zu zlib=%zu raw=%zu native=%zu missing_adler=%zu"
+		" validation=%s checksum_verified=%u result=ok\n",
+		static_cast<unsigned long long>(seq),
+		static_cast<unsigned long long>(ino), algo,
+		static_cast<unsigned long long>(logical_size), blocks, zlib, raw,
+		native, missing_adler, validation, checksum_verified ? 1u : 0u);
 	if (n <= 0)
 		return std::string();
 	const size_t len = std::min(sizeof(line) - 1, static_cast<size_t>(n));
@@ -400,13 +441,15 @@ bool IsDecompAlgoInRsrc(uint16_t algo)
 bool DecompressFile(ApfsDir &dir, uint64_t ino, std::vector<uint8_t> &decompressed,
 	const std::vector<uint8_t> &compressed, DecompressResult *result)
 {
+	const uint64_t seq = g_decompress_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+
 	decompressed.clear();
 	if (result)
 		*result = DecompressResult();
 
 	if (compressed.size() < sizeof(CompressionHeader))
 	{
-		EmitError(ino, 0, 0, "header", "short");
+		EmitError(seq, ino, 0, 0, "header", "short");
 		return false;
 	}
 
@@ -417,13 +460,50 @@ bool DecompressFile(ApfsDir &dir, uint64_t ino, std::vector<uint8_t> &decompress
 	const size_t csize = compressed.size() - sizeof(CompressionHeader);
 
 	auto fail = [&](const char *stage, size_t block, const char *reason) -> bool {
-		EmitError(ino, algo, block, stage, reason);
 		decompressed.clear();
+		if (result)
+			*result = DecompressResult();
+		EmitError(seq, ino, algo, block, stage, reason);
 		return false;
 	};
 
-	if (logical_size == 0)
-		return IsDecompAlgoSupported(algo) ? true : fail("header", 0, "unsupported_algo");
+	auto finish = [&](size_t blocks, size_t zlib_blocks, size_t raw_blocks,
+		size_t native_blocks, size_t missing_blocks,
+		const std::string &validation_log) -> bool {
+		if (zlib_blocks + raw_blocks + native_blocks != blocks)
+			return fail("object", 0, "block_accounting");
+
+		const bool checksum_verified = blocks > 0 && zlib_blocks == blocks &&
+			missing_blocks == 0;
+
+		std::string blob;
+		try
+		{
+			blob = validation_log;
+			blob += FormatObject(seq, ino, algo, logical_size, blocks,
+				zlib_blocks, raw_blocks, native_blocks, missing_blocks,
+				checksum_verified);
+		}
+		catch (const std::bad_alloc &)
+		{
+			return fail("allocate", 0, "diagnostic");
+		}
+
+		EmitBlob(blob);
+		if (result)
+		{
+			result->seq = seq;
+			result->logical_size = logical_size;
+			result->block_count = blocks;
+			result->zlib_block_count = zlib_blocks;
+			result->raw_block_count = raw_blocks;
+			result->native_block_count = native_blocks;
+			result->missing_adler_block_count = missing_blocks;
+			result->accepted_missing_adler = missing_blocks != 0;
+			result->checksum_verified = checksum_verified;
+		}
+		return true;
+	};
 
 #if 1 // Disable to get compressed data
 	if (g_debug & Dbg_Cmpfs)
@@ -448,7 +528,7 @@ bool DecompressFile(ApfsDir &dir, uint64_t ino, std::vector<uint8_t> &decompress
 		std::cout << std::endl;
 	}
 
-	if (!IsDecompAlgoSupported(hdr->algo))
+	if (!IsDecompAlgoSupported(algo))
 	{
 		if (g_debug & Dbg_Errors) {
 			std::cout << "Unsupported decompression algorithm." << std::endl;
@@ -456,6 +536,9 @@ bool DecompressFile(ApfsDir &dir, uint64_t ino, std::vector<uint8_t> &decompress
 		}
 		return fail("algorithm", 0, "unsupported");
 	}
+
+	if (logical_size == 0)
+		return finish(0, 0, 0, 0, 0, std::string());
 
 	if (IsDecompAlgoInRsrc(hdr->algo))
 	{
@@ -487,8 +570,10 @@ bool DecompressFile(ApfsDir &dir, uint64_t ino, std::vector<uint8_t> &decompress
 			return fail("allocate", 0, reason);
 
 		size_t zlib_blocks = 0;
+		size_t raw_blocks = 0;
+		size_t native_blocks = 0;
 		size_t missing_blocks = 0;
-		std::vector<std::string> validation_lines;
+		std::string validation_log;
 
 		for (k = 0; k < records.size(); k++)
 		{
@@ -518,6 +603,7 @@ bool DecompressFile(ApfsDir &dir, uint64_t ino, std::vector<uint8_t> &decompress
 						return fail("block", k, "raw_marker_length");
 					std::memcpy(dst, src + 1, expected);
 					decoded_bytes = expected;
+					raw_blocks++;
 				}
 				else
 				{
@@ -531,8 +617,8 @@ bool DecompressFile(ApfsDir &dir, uint64_t ino, std::vector<uint8_t> &decompress
 				{
 					try
 					{
-						validation_lines.push_back(FormatValidation(ino, algo, k,
-							src_len, expected, decoded_bytes, missing_adler));
+						validation_log += FormatValidation(seq, ino, algo, k,
+							src_len, expected, decoded_bytes, missing_adler);
 					}
 					catch (const std::bad_alloc &)
 					{
@@ -549,18 +635,23 @@ bool DecompressFile(ApfsDir &dir, uint64_t ino, std::vector<uint8_t> &decompress
 							return fail("block", k, "raw_marker_length");
 						std::memcpy(dst, src + 1, expected);
 						decoded_bytes = expected;
+						raw_blocks++;
 					}
-					else
+					else {
 						decoded_bytes = DecompressLZVN(dst, expected, src, src_len);
+						native_blocks++;
+					}
 					break;
 				case 10:
 					if (src_len != expected + 1)
 						return fail("block", k, "raw_marker_length");
 					std::memcpy(dst, src + 1, expected);
 					decoded_bytes = expected;
+					raw_blocks++;
 					break;
 				case 12:
 					decoded_bytes = DecompressLZFSE(dst, expected, src, src_len);
+					native_blocks++;
 					break;
 				case 14:
 					if (src[0] == 0xFF) {
@@ -568,9 +659,12 @@ bool DecompressFile(ApfsDir &dir, uint64_t ino, std::vector<uint8_t> &decompress
 							return fail("block", k, "raw_marker_length");
 						std::memcpy(dst, src + 1, expected);
 						decoded_bytes = expected;
+						raw_blocks++;
 					}
-					else
+					else {
 						decoded_bytes = DecompressLZBITMAP(dst, expected, src, src_len);
+						native_blocks++;
+					}
 					break;
 				default:
 					return fail("block", k, "unsupported");
@@ -581,17 +675,12 @@ bool DecompressFile(ApfsDir &dir, uint64_t ino, std::vector<uint8_t> &decompress
 			}
 		}
 
-		// Emit per-block validation only after the whole object decoded, so a
-		// failure later in the object cannot leave a success-looking line.
-		for (size_t i = 0; i < validation_lines.size(); i++)
-			EmitLine(validation_lines[i]);
-
-		if (result)
-		{
-			result->accepted_missing_adler = missing_blocks != 0;
-			result->zlib_block_count = zlib_blocks;
-			result->missing_adler_block_count = missing_blocks;
-		}
+		// Publish the validation lines and the object summary together, after
+		// the whole object decoded. A later block failure therefore cannot
+		// leave a success-looking line, and concurrent objects cannot
+		// interleave within one object's log.
+		return finish(records.size(), zlib_blocks, raw_blocks, native_blocks,
+			missing_blocks, validation_log);
 	}
 	else
 	{
@@ -603,6 +692,11 @@ bool DecompressFile(ApfsDir &dir, uint64_t ino, std::vector<uint8_t> &decompress
 			return fail("inline", 0, "payload_short");
 
 		size_t decoded_bytes = 0;
+		size_t zlib_blocks = 0;
+		size_t raw_blocks = 0;
+		size_t native_blocks = 0;
+		size_t missing_blocks = 0;
+		std::string validation_log;
 
 		switch (hdr->algo) {
 		case 3:
@@ -613,20 +707,16 @@ bool DecompressFile(ApfsDir &dir, uint64_t ino, std::vector<uint8_t> &decompress
 					cdata, csize, true, &missing_adler);
 				if (decoded_bytes == decompressed.size())
 				{
+					zlib_blocks = 1;
+					missing_blocks = missing_adler ? 1 : 0;
 					try
 					{
-						EmitLine(FormatValidation(ino, algo, 0, csize,
-							decompressed.size(), decoded_bytes, missing_adler));
+						validation_log = FormatValidation(seq, ino, algo, 0, csize,
+							decompressed.size(), decoded_bytes, missing_adler);
 					}
 					catch (const std::bad_alloc &)
 					{
 						return fail("allocate", 0, "diagnostic");
-					}
-					if (result)
-					{
-						result->accepted_missing_adler = missing_adler;
-						result->zlib_block_count = 1;
-						result->missing_adler_block_count = missing_adler ? 1 : 0;
 					}
 				}
 			}
@@ -635,6 +725,7 @@ bool DecompressFile(ApfsDir &dir, uint64_t ino, std::vector<uint8_t> &decompress
 					return fail("inline", 0, "raw_marker_length");
 				decompressed.assign(cdata + 1, cdata + csize);
 				decoded_bytes = decompressed.size();
+				raw_blocks = 1;
 			}
 			else
 				return fail("inline", 0, "zlib_marker");
@@ -646,9 +737,12 @@ bool DecompressFile(ApfsDir &dir, uint64_t ino, std::vector<uint8_t> &decompress
 					return fail("inline", 0, "raw_marker_length");
 				decompressed.assign(cdata + 1, cdata + csize);
 				decoded_bytes = decompressed.size();
+				raw_blocks = 1;
 			}
-			else
+			else {
 				decoded_bytes = DecompressLZVN(decompressed.data(), decompressed.size(), cdata, csize);
+				native_blocks = 1;
+			}
 			break;
 
 		case 9:
@@ -656,11 +750,13 @@ bool DecompressFile(ApfsDir &dir, uint64_t ino, std::vector<uint8_t> &decompress
 				return fail("inline", 0, "raw_marker_length");
 			decompressed.assign(cdata + 1, cdata + csize);
 			decoded_bytes = decompressed.size();
+			raw_blocks = 1;
 			break;
 
 		case 11:
 			// TODO uncompressed variant?
 			decoded_bytes = DecompressLZFSE(decompressed.data(), decompressed.size(), cdata, csize);
+			native_blocks = 1;
 			break;
 
 		case 13:
@@ -669,9 +765,12 @@ bool DecompressFile(ApfsDir &dir, uint64_t ino, std::vector<uint8_t> &decompress
 					return fail("inline", 0, "raw_marker_length");
 				decompressed.assign(cdata + 1, cdata + csize);
 				decoded_bytes = decompressed.size();
+				raw_blocks = 1;
 			}
-			else
+			else {
 				decoded_bytes = DecompressLZBITMAP(decompressed.data(), decompressed.size(), cdata, csize);
+				native_blocks = 1;
+			}
 			break;
 
 		default:
@@ -680,6 +779,9 @@ bool DecompressFile(ApfsDir &dir, uint64_t ino, std::vector<uint8_t> &decompress
 
 		if (decoded_bytes != logical_size)
 			return fail("inline", 0, "decoded_length");
+
+		return finish(1, zlib_blocks, raw_blocks, native_blocks,
+			missing_blocks, validation_log);
 	}
 
 #else
