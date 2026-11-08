@@ -170,7 +170,7 @@ C 阶段验收仍需在只读生产源上逐个对象真实读通，并用独立
 
 - 从本分支构建到新路径，不覆盖生产 `/opt` binary；生产 NAS 挂载保持原状。
 - backup view 只用于同一只读设备上的独立只读备份实例。启用前按 D 前检查项验证双实例共存、密码渠道、只读性和资源占用；不重挂或替换 NAS。
-- 备份实例使用 `-o backup_view=1`，并按可用内存设置 `-o max_decomp_size=N`；manifest 记录 reader binary SHA、挂载选项（含上限）、卷 UUID、分类/隐藏规则版本和实例身份。manifest 与 restic 必须使用同一实例和规则版本。
+- 备份实例必须使用 `-d 1` 前台运行，将 stderr 交由 systemd journal 收集；默认 daemon 模式会将 stderr 重定向到 /dev/null，无法保留 Unicode fallback 和压缩告警。T2 验证前台精确名字回退日志。备份实例使用 `-o backup_view=1`，并按可用内存设置 `-o max_decomp_size=N`；manifest 记录 reader binary SHA、挂载选项（含上限）、卷 UUID、分类/隐藏规则版本和实例身份。manifest 与 restic 必须使用同一实例和规则版本。
 - 回滚：停止备份任务并卸载独立实例，回到原 reader/原挂载；不删除源、不删除云对象、不改 manifest 证据。
 - 若 backup view 分类返回 `EIO`，备份工具必须把该对象列入例外并阻断该批封存，不能用 `-l` 或过滤规则绕过。
 

@@ -164,20 +164,15 @@ static IoStatus apfs_stat_internal(fuse_ino_t ino, struct stat &st)
 				{
 					st.st_size = rec.uncompressed_size;
 				}
-				else if (cls == CompressionClass::InlineAttr || cls == CompressionClass::ResourceFork)
-				{
-					st.st_size = uncompressed_size;
-					// st.st_blocks = data.size() / 512;
-					if (g_debug & Dbg_Cmpfs)
-						std::cout << "Compressed size " << uncompressed_size << " bytes." << std::endl;
-				}
 				else if (cls == CompressionClass::UnsupportedAlgorithm)
 				{
 					st.st_size = decmpfs_attr_size;
 				}
 				else
 				{
-					st.st_size = 0;
+					// Preserve the header's logical size even when its carrier
+					// is unusable; open/read still fail closed.
+					st.st_size = uncompressed_size;
 				}
 
 				if (CompressionClassIsError(cls))

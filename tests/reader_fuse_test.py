@@ -27,7 +27,12 @@ def fail(message):
     sys.exit(1)
 
 
-def mount(image, extra=()):
+FOREGROUND = None
+FOREGROUND_LOG = None
+
+
+def mount(image, extra=(), foreground=False):
+    global FOREGROUND, FOREGROUND_LOG
     args = [BIN]
     options = []
     if extra:
@@ -35,18 +40,26 @@ def mount(image, extra=()):
     if options:
         args.extend(["-o", ",".join(options)])
     args.extend([image, MNT])
-    subprocess.run(PREFIX + args, check=True)
+    if foreground:
+        FOREGROUND_LOG = open(os.path.join(WORK, "foreground.log"), "wb")
+        FOREGROUND = subprocess.Popen(PREFIX + [BIN, "-d", "1"] + args[1:],
+                                      stdout=FOREGROUND_LOG, stderr=FOREGROUND_LOG)
+    else:
+        subprocess.run(PREFIX + args, check=True)
     deadline = time.time() + 15
     while time.time() < deadline:
         try:
-            os.listdir(MNT)
-            return
+            if os.path.ismount(MNT):
+                os.listdir(MNT)
+                return
+            time.sleep(0.05)
         except OSError:
             time.sleep(0.05)
     fail("mount did not become ready: " + image)
 
 
 def unmount():
+    global FOREGROUND, FOREGROUND_LOG
     subprocess.run(PREFIX + [FUSERMOUNT, "-u", MNT], check=False,
                    stderr=subprocess.DEVNULL)
     time.sleep(0.1)
@@ -58,6 +71,10 @@ def unmount():
     deadline = time.time() + 10
     while time.time() < deadline:
         if not os.path.ismount(MNT):
+            if FOREGROUND is not None:
+                FOREGROUND.wait(timeout=10)
+                FOREGROUND_LOG.close()
+                FOREGROUND = FOREGROUND_LOG = None
             return
         time.sleep(0.05)
     fail("unmount did not complete")
@@ -102,8 +119,11 @@ def test_good_default():
     # Damaged compression metadata must not make the object unreachable: the
     # backup manifest still needs type/mode/size.
     st = os.stat(os.path.join(root, "inline-empty"))
-    if st.st_size != 0:
+    if st.st_size != 100:
         fail("inline-empty default size changed: %d" % st.st_size)
+    st = os.stat(os.path.join(root, "rf-missing"))
+    if st.st_size != 200:
+        fail("rf-missing default size changed: %d" % st.st_size)
     st = os.stat(os.path.join(root, "size-mismatch"))
     if st.st_size != 99:
         fail("size-mismatch default size changed: %d" % st.st_size)
@@ -196,10 +216,23 @@ def test_bad():
     unmount()
 
 
+def test_foreground_log():
+    mount(os.path.join(WORK, "good.img"), foreground=True)
+    try:
+        os.stat(os.path.join(MNT, "root", "unicode-\U0001f9e8"))
+    finally:
+        unmount()
+    with open(os.path.join(WORK, "foreground.log"), "rb") as log:
+        data = log.read()
+    if b"APFS_UNICODE_FALLBACK" not in data or b"name_hex=756e69636f64652df09fa7a8" not in data:
+        fail("foreground fallback log missing")
+
+
 def main():
     test_good_default()
     test_good_backup()
     test_bad()
+    test_foreground_log()
     print("FUSE reader tests passed")
 
 
