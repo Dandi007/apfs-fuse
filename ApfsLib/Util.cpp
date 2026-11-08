@@ -20,6 +20,7 @@
 #include "Unicode.h"
 
 #include <cassert>
+#include <climits>
 
 #include <iostream>
 #include <iomanip>
@@ -429,16 +430,25 @@ bool GetPassword(std::string &pw)
 
 size_t DecompressZLib(uint8_t *dst, size_t dst_size, const uint8_t *src, size_t src_size)
 {
-	// size_t nwr = 0;
 	int ret;
+
+	// zlib tracks input and output in uInt. Reject sizes that do not fit
+	// instead of silently truncating them and decompressing a different
+	// range than the caller asked for.
+	if (src_size > static_cast<size_t>(UINT_MAX) ||
+		dst_size > static_cast<size_t>(UINT_MAX))
+	{
+		std::cerr << "DecompressZLib: input or output size out of range." << std::endl;
+		return 0;
+	}
 
 	z_stream strm;
 
 	memset(&strm, 0, sizeof(strm));
 	strm.zalloc = Z_NULL;
 	strm.zfree = Z_NULL;
-	strm.avail_in = src_size;
-	strm.avail_out = dst_size;
+	strm.avail_in = static_cast<uInt>(src_size);
+	strm.avail_out = static_cast<uInt>(dst_size);
 	strm.next_in = const_cast<uint8_t *>(src);
 	strm.next_out = dst;
 
@@ -449,18 +459,52 @@ size_t DecompressZLib(uint8_t *dst, size_t dst_size, const uint8_t *src, size_t 
 		return 0;
 	}
 
-	do {
+	bool complete = false;
+
+	for (;;)
+	{
+		const uInt avail_in = strm.avail_in;
+		const uInt avail_out = strm.avail_out;
+
 		ret = inflate(&strm, Z_NO_FLUSH);
-		if (ret == Z_NEED_DICT || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR)
+
+		if (ret == Z_STREAM_END)
 		{
-			strm.avail_out = 0;
+			complete = true;
 			break;
 		}
-	} while (ret != Z_STREAM_END);
+
+		// Z_BUF_ERROR means no progress is possible: the input ended
+		// before the stream did, or the output buffer is full. The old
+		// loop only stopped on Z_STREAM_END, so such streams spun here
+		// forever. Any other non-Z_OK code is a hard failure as well.
+		if (ret != Z_OK)
+			break;
+
+		// Defensive guard: a zlib call that consumes nothing and
+		// produces nothing cannot make progress.
+		if (strm.avail_in == avail_in && strm.avail_out == avail_out)
+			break;
+	}
+
+	const size_t decoded = dst_size - strm.avail_out;
+
+	if (!complete)
+		std::cerr << "APFS_ZLIB_ERROR ret=" << ret
+			<< " msg=" << (strm.msg ? strm.msg : "none")
+			<< " total_in=" << strm.total_in << " total_out=" << strm.total_out
+			<< " src_size=" << src_size << " dst_size=" << dst_size << std::endl;
 
 	inflateEnd(&strm);
 
-	return dst_size - strm.avail_out;
+	// Never report a plausible length for a truncated or damaged stream.
+	// Callers compare the result against the expected chunk length, so a
+	// non-zero partial count would let bad data through; zero always
+	// fails that comparison when the expected output length is non-zero.
+	if (!complete)
+		return 0;
+
+	return decoded;
 }
 
 size_t DecompressADC(uint8_t * dst, size_t dst_size, const uint8_t * src, size_t src_size)

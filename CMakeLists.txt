@@ -164,6 +164,10 @@ if (BUILD_TESTING)
   target_link_libraries(reader-policy-test apfs)
   add_test(NAME reader-policy COMMAND reader-policy-test)
 
+  add_executable(zlib-decompress-test tests/ZlibDecompressTest.cpp)
+  target_link_libraries(zlib-decompress-test apfs crypto)
+  add_test(NAME zlib-decompress COMMAND zlib-decompress-test)
+
   add_library(apfs-fixture STATIC tests/ApfsFixture.cpp tests/ApfsFixture.h
     tests/RfContent.cpp tests/RfContent.h)
   target_link_libraries(apfs-fixture apfs lzfse z)
