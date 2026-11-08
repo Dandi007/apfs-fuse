@@ -72,6 +72,8 @@ static void requireBytes(const std::vector<uint8_t> &actual,
 }
 
 static void TestResourceForkContent(ApfsDir &dir);
+static void TestMissingAdlerDiagnostics(ApfsDir &dir, const std::string &image_path);
+static void TestRfBoundsRejects(ApfsDir &dir, const std::string &image_path);
 static void TestInlineZlibContent(ApfsDir &dir, const std::string &image_path);
 
 // Captures std::cerr for one call so the test can assert the zlib failure
@@ -235,6 +237,8 @@ static void TestGoodImage(const std::string &path)
 		CompressionClass::InlineAttr, "unlimited decompression accepts the same inode");
 
 	TestResourceForkContent(dir);
+	TestMissingAdlerDiagnostics(dir, path);
+	TestRfBoundsRejects(dir, path);
 	TestInlineZlibContent(dir, path);
 }
 
@@ -339,6 +343,185 @@ static void TestResourceForkContent(ApfsDir &dir)
 		"inline file with user RF still classifies as inline");
 	require(!HidesResourceFork(CompressionClass::InlineAttr),
 		"inline compression does not hide the user resource fork");
+}
+
+static size_t CountOccurrences(const std::string &text, const std::string &needle)
+{
+	size_t count = 0;
+	size_t pos = 0;
+	while ((pos = text.find(needle, pos)) != std::string::npos)
+	{
+		count++;
+		pos += needle.size();
+	}
+	return count;
+}
+
+// Every RF block that zlib accepts through the missing-Adler boundary must
+// produce exactly one attributable line; a normal Z_STREAM_END block must be
+// labelled as checksum-verified instead. The positive control is inode 67
+// (carrier stored without the trailer), the control inodes 60/61 keep it.
+static void TestMissingAdlerDiagnostics(ApfsDir &dir, const std::string &image_path)
+{
+	IoStatus st = IoStatus::Ok;
+
+	struct Case
+	{
+		uint64_t ino;
+		const char *name;
+		size_t lines;
+		bool missing_adler;
+	};
+
+	const Case cases[] = {
+		{60, "rf-zlib-1blk", 1, false},
+		{61, "rf-zlib-multi", 3, false},
+		{67, "rf-zlib-no-adler", 1, true},
+	};
+
+	for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++)
+	{
+		const Case &item = cases[c];
+		std::vector<uint8_t> decmpfs;
+		require(dir.GetAttribute(decmpfs, item.ino, "com.apple.decmpfs", &st) &&
+			st == IoStatus::Ok, std::string(item.name) + ": decmpfs read");
+
+		DecompressResult result;
+		std::vector<uint8_t> decoded;
+		std::string log;
+		bool ok = false;
+
+		{
+			CerrCapture capture;
+			ok = DecompressFile(dir, item.ino, decoded, decmpfs, &result);
+			log = capture.str();
+		}
+
+		require(ok, std::string(item.name) + ": DecompressFile");
+		require(result.zlib_block_count == item.lines,
+			std::string(item.name) + ": zlib block count");
+		require(result.missing_adler_block_count ==
+			(item.missing_adler ? item.lines : 0),
+			std::string(item.name) + ": missing-Adler block count");
+		require(result.accepted_missing_adler == item.missing_adler,
+			std::string(item.name) + ": accepted_missing_adler");
+
+		require(CountOccurrences(log, "APFS_DECMPFS_VALIDATION") == item.lines,
+			std::string(item.name) + ": validation line count");
+		require(log.find("APFS_DECMPFS_ERROR") == std::string::npos,
+			std::string(item.name) + ": success must not log an error");
+		require(log.find("ino=" + std::to_string(item.ino)) != std::string::npos,
+			std::string(item.name) + ": diagnostic ino");
+		require(log.find("algo=4") != std::string::npos,
+			std::string(item.name) + ": diagnostic algo");
+		require(log.find("compressed=") != std::string::npos,
+			std::string(item.name) + ": diagnostic compressed length");
+		require(log.find("expected=") != std::string::npos,
+			std::string(item.name) + ": diagnostic expected length");
+		require(log.find("decoded=") != std::string::npos,
+			std::string(item.name) + ": diagnostic decoded length");
+		require(log.find(item.missing_adler ? "validation=structure_length_only" :
+			"validation=length_with_checksum") != std::string::npos,
+			std::string(item.name) + ": validation class");
+		require(log.find(item.missing_adler ? "missing_adler=1" : "missing_adler=0") !=
+			std::string::npos, std::string(item.name) + ": missing_adler flag");
+		require(log.find(image_path) == std::string::npos,
+			std::string(item.name) + ": diagnostic leaks the image path");
+		require(log.find(item.name) == std::string::npos,
+			std::string(item.name) + ": diagnostic leaks the file name");
+
+		if (item.ino == 61)
+		{
+			for (size_t block = 0; block < item.lines; block++)
+				require(log.find("block=" + std::to_string(block)) != std::string::npos,
+					"rf-zlib-multi: diagnostic block index");
+		}
+	}
+}
+
+// Malformed carriers in the good image are real inode/xattr records. Every
+// call must fail closed, leave no success diagnostic and never trust a size
+// or offset that was not validated against the declared data section.
+static void TestRfBoundsRejects(ApfsDir &dir, const std::string &image_path)
+{
+	struct Case
+	{
+		uint64_t ino;
+		const char *name;
+		uint32_t algo;
+		const char *stage;
+		const char *reason;
+	};
+
+	const Case cases[] = {
+		{70, "rf-bad-few-blocks", 4, "rsrc_table", "block_count"},
+		{71, "rf-bad-many-blocks", 4, "rsrc_table", "block_count"},
+		{72, "rf-bad-short-table", 4, "rsrc_table", "table_short"},
+		{73, "rf-bad-zero-block", 4, "rsrc_table", "block_empty"},
+		{74, "rf-bad-block-size", 4, "rsrc_table", "block_size"},
+		{75, "rf-bad-overlap", 4, "rsrc_table", "block_overlap"},
+		{76, "rf-bad-table-pointer", 4, "rsrc_table", "block_offset"},
+		{77, "rf-bad-raw-length", 4, "block", "raw_marker_length"},
+		{78, "rf-bad-data-offset", 4, "rsrc_table", "data_offset"},
+		{79, "rf-bad-huge-size", 4, "rsrc_table", "block_count"},
+		{80, "rf-bad-zero-size", 4, "header", "logical_size_zero"},
+		{81, "rf-bad-short-header", 4, "rsrc_table", "rsrc_header_short"},
+		{82, "rf-bad-empty-carrier", 4, "rsrc", nullptr},
+		{83, "rf-bad-off-table-short", 8, "rsrc_table", "table_short"},
+		{84, "rf-bad-off-table-pointer", 8, "rsrc_table", "table_pointer"},
+		{85, "rf-bad-off-zero", 8, "rsrc_table", "block_empty"},
+		{86, "rf-bad-off-beyond", 8, "rsrc_table", "block_offset"},
+		{87, "rf-bad-lzvn-raw-length", 8, "block", "raw_marker_length"},
+		{88, "rf-bad-raw10-length", 10, "block", "raw_marker_length"},
+		{89, "rf-bad-raw14-length", 14, "block", "raw_marker_length"},
+		{90, "rf-bad-partial-decode", 4, "block", "block_marker"},
+	};
+
+	IoStatus st = IoStatus::Ok;
+
+	for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++)
+	{
+		const Case &item = cases[c];
+		const std::string label = item.name;
+
+		std::vector<uint8_t> decmpfs;
+		require(dir.GetAttribute(decmpfs, item.ino, "com.apple.decmpfs", &st) &&
+			st == IoStatus::Ok, label + ": decmpfs read");
+
+		DecompressResult result;
+		std::vector<uint8_t> decoded;
+		std::string log;
+		bool ok = true;
+
+		{
+			CerrCapture capture;
+			ok = DecompressFile(dir, item.ino, decoded, decmpfs, &result);
+			log = capture.str();
+		}
+
+		require(!ok, label + ": malformed carrier must fail closed");
+		require(result.zlib_block_count == 0 && result.missing_adler_block_count == 0 &&
+			!result.accepted_missing_adler, label + ": failure must not report success");
+		require(log.find("APFS_DECMPFS_ERROR") != std::string::npos,
+			label + ": missing error diagnostic");
+		require(log.find("APFS_DECMPFS_VALIDATION") == std::string::npos,
+			label + ": failure must not print a success diagnostic");
+		require(log.find("ino=" + std::to_string(item.ino)) != std::string::npos,
+			label + ": diagnostic ino");
+		require(log.find("algo=" + std::to_string(item.algo)) != std::string::npos,
+			label + ": diagnostic algo");
+		require(log.find("block=") != std::string::npos,
+			label + ": diagnostic block");
+		require(log.find(std::string("stage=") + item.stage) != std::string::npos,
+			label + ": diagnostic stage " + item.stage);
+		if (item.reason)
+			require(log.find(std::string("reason=") + item.reason) != std::string::npos,
+				label + ": diagnostic reason " + item.reason);
+		require(log.find(image_path) == std::string::npos,
+			label + ": diagnostic leaks the image path");
+		require(log.find(item.name) == std::string::npos,
+			label + ": diagnostic leaks the file name");
+	}
 }
 
 static void TestInlineZlibContent(ApfsDir &dir, const std::string &image_path)
