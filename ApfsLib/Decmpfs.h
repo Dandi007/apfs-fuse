@@ -19,6 +19,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <vector>
 
 #include "ApfsDir.h"
@@ -30,7 +31,19 @@ struct CompressionHeader
 	le_uint64_t size;
 };
 
+// Optional per-object decode metadata. Defaults keep every existing caller
+// source-compatible. accepted_missing_adler is only set when at least one
+// zlib block was accepted without its RFC 1950 Adler-32 trailer; such output
+// is length/structure verified, not checksum verified.
+struct DecompressResult
+{
+	bool accepted_missing_adler = false;
+	size_t zlib_block_count = 0;
+	size_t missing_adler_block_count = 0;
+};
+
 bool IsDecompAlgoSupported(uint16_t algo);
 bool IsDecompAlgoInRsrc(uint16_t algo);
 
-bool DecompressFile(ApfsDir &dir, uint64_t ino, std::vector<uint8_t> &decompressed, const std::vector<uint8_t> &compressed);
+bool DecompressFile(ApfsDir &dir, uint64_t ino, std::vector<uint8_t> &decompressed,
+	const std::vector<uint8_t> &compressed, DecompressResult *result = nullptr);

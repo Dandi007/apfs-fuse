@@ -428,9 +428,13 @@ bool GetPassword(std::string &pw)
 #endif
 }
 
-size_t DecompressZLib(uint8_t *dst, size_t dst_size, const uint8_t *src, size_t src_size, bool allow_missing_adler)
+size_t DecompressZLib(uint8_t *dst, size_t dst_size, const uint8_t *src, size_t src_size,
+	bool allow_missing_adler, bool *missing_adler_out)
 {
 	int ret;
+
+	if (missing_adler_out)
+		*missing_adler_out = false;
 
 	// zlib tracks input and output in uInt. Reject sizes that do not fit
 	// instead of silently truncating them and decompressing a different
@@ -460,6 +464,7 @@ size_t DecompressZLib(uint8_t *dst, size_t dst_size, const uint8_t *src, size_t 
 	}
 
 	bool complete = false;
+	bool missing_adler = false;
 
 	for (;;)
 	{
@@ -481,6 +486,7 @@ size_t DecompressZLib(uint8_t *dst, size_t dst_size, const uint8_t *src, size_t 
 			strm.avail_in == 0 && strm.total_out > 0)
 		{
 			complete = true;
+			missing_adler = true;
 			break;
 		}
 
@@ -515,6 +521,9 @@ size_t DecompressZLib(uint8_t *dst, size_t dst_size, const uint8_t *src, size_t 
 	// fails that comparison when the expected output length is non-zero.
 	if (!complete)
 		return 0;
+
+	if (missing_adler_out)
+		*missing_adler_out = missing_adler;
 
 	return decoded;
 }
