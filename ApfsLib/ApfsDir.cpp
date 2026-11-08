@@ -20,14 +20,19 @@
 #include <iostream>
 #include <iomanip>
 #include <algorithm>
+#include <new>
+#include <stdexcept>
 
 #include <cassert>
+#include <cstddef>
 #include <cstring>
 
 #include "ApfsDir.h"
 #include "ApfsVolume.h"
 #include "ApfsContainer.h"
 #include "BTree.h"
+#include "ExtentReader.h"
+#include "ReaderPolicy.h"
 #include "Util.h"
 
 #ifndef _MSC_VER
@@ -38,6 +43,15 @@ void strcpy_s(char (&dst)[L], const char *src)
 	dst[L - 1] = 0;
 }
 #endif
+
+static void log_unicode_fallback(uint64_t parent_id, const char *name)
+{
+	std::cerr << "APFS_UNICODE_FALLBACK parent_id=" << parent_id << " name_hex=";
+	std::cerr << std::hex << std::setfill('0');
+	for (const unsigned char *p = reinterpret_cast<const unsigned char *>(name); *p; p++)
+		std::cerr << std::setw(2) << static_cast<unsigned int>(*p);
+	std::cerr << std::dec << std::endl;
+}
 
 ApfsDir::Inode::Inode()
 {
@@ -163,6 +177,20 @@ ApfsDir::DirRec::DirRec(const ApfsDir::DirRec& o)
 	has_sibling_id = o.has_sibling_id;
 }
 
+ApfsDir::XAttr::XAttr()
+{
+	flags = 0;
+	xdata_len = 0;
+	memset(&xstrm, 0, sizeof(xstrm));
+}
+
+ApfsDir::XAttr::XAttr(const ApfsDir::XAttr& o)
+{
+	flags = o.flags;
+	xdata_len = o.xdata_len;
+	xstrm = o.xstrm;
+}
+
 ApfsDir::ApfsDir(ApfsVolume &vol) :
 	m_vol(vol),
 	m_fs_tree(vol.fstree())
@@ -170,10 +198,6 @@ ApfsDir::ApfsDir(ApfsVolume &vol) :
 	m_txt_fmt = vol.getTextFormat();
 
 	m_blksize = vol.getContainer().GetBlocksize();
-	m_blksize_sh = log2(m_blksize);
-	m_blksize_mask_lo = m_blksize - 1;
-	m_blksize_mask_hi = ~m_blksize_mask_lo;
-	m_tmp_blk.resize(m_blksize);
 	// m_bt.EnableDebugOutput();
 }
 
@@ -181,18 +205,114 @@ ApfsDir::~ApfsDir()
 {
 }
 
-bool ApfsDir::GetInode(ApfsDir::Inode& res, uint64_t inode)
+class ApfsDir::ExtentSourceImpl : public ExtentSource
+{
+public:
+	ExtentSourceImpl(ApfsDir &dir, uint64_t ino) :
+		m_dir(dir)
+	{
+		(void)ino;
+	}
+
+	IoStatus LookupExtent(uint64_t ino, uint64_t offs, ExtentInfo &extent) override
+	{
+		BTreeEntry e;
+		bool hard_error = false;
+		bool rc;
+
+		if (m_dir.m_vol.isSealed())
+		{
+			fext_tree_key_t key;
+			key.private_id = ino;
+			key.logical_addr = offs;
+
+			rc = m_dir.m_vol.fexttree().Lookup(e, &key, sizeof(key), CompareFextKey, &m_dir, false, &hard_error);
+			if (!rc)
+				return hard_error ? IoStatus::IoError : IoStatus::NotFound;
+
+			if (e.key_len < sizeof(fext_tree_key_t) || e.val_len < sizeof(fext_tree_val_t))
+				return IoStatus::IoError;
+
+			const fext_tree_key_t *k = reinterpret_cast<const fext_tree_key_t *>(e.key);
+			const fext_tree_val_t *v = reinterpret_cast<const fext_tree_val_t *>(e.val);
+
+			if (k->private_id != ino)
+				return IoStatus::NotFound;
+
+			extent.logical_addr = k->logical_addr;
+			extent.length = v->len_and_flags & J_FILE_EXTENT_LEN_MASK;
+			extent.phys_block = v->phys_block_num;
+			extent.crypto_id = 0;
+		}
+		else
+		{
+			j_file_extent_key_t key;
+			key.hdr.obj_id_and_type = APFS_TYPE_ID(APFS_TYPE_FILE_EXTENT, ino);
+			key.logical_addr = offs;
+
+			rc = m_dir.m_fs_tree.Lookup(e, &key, sizeof(key), CompareStdDirKey, &m_dir, false, &hard_error);
+			if (!rc)
+				return hard_error ? IoStatus::IoError : IoStatus::NotFound;
+
+			if (e.key_len < sizeof(j_file_extent_key_t) || e.val_len < sizeof(j_file_extent_val_t))
+				return IoStatus::IoError;
+
+			const j_file_extent_key_t *k = reinterpret_cast<const j_file_extent_key_t *>(e.key);
+			const j_file_extent_val_t *v = reinterpret_cast<const j_file_extent_val_t *>(e.val);
+
+			if (k->hdr.obj_id_and_type != key.hdr.obj_id_and_type)
+				return IoStatus::NotFound;
+
+			extent.logical_addr = k->logical_addr;
+			extent.length = v->len_and_flags & J_FILE_EXTENT_LEN_MASK;
+			extent.phys_block = v->phys_block_num;
+			extent.crypto_id = v->crypto_id;
+		}
+
+		return IoStatus::Ok;
+	}
+
+	bool ReadBlocks(void *data, uint64_t paddr, uint64_t blkcnt, uint64_t crypto_id) override
+	{
+		return m_dir.m_vol.ReadBlocks(reinterpret_cast<uint8_t *>(data), paddr, blkcnt, crypto_id);
+	}
+
+	uint32_t BlockSize() const override
+	{
+		return m_dir.m_blksize;
+	}
+
+private:
+	ApfsDir &m_dir;
+};
+
+bool ApfsDir::GetInode(ApfsDir::Inode& res, uint64_t inode, IoStatus *status)
 {
 	BTreeEntry bte;
 	j_inode_key_t key;
+	bool hard_error = false;
 	bool rc;
+
+	if (status)
+		*status = IoStatus::Ok;
 
 	key.hdr.obj_id_and_type = APFS_TYPE_ID(APFS_TYPE_INODE, inode);
 
-	rc = m_fs_tree.Lookup(bte, &key, sizeof(j_inode_key_t), CompareStdDirKey, this, true);
+	rc = m_fs_tree.Lookup(bte, &key, sizeof(j_inode_key_t), CompareStdDirKey, this, true, &hard_error);
 
-	if (!rc || (bte.val == nullptr))
+	if (!rc)
+	{
+		if (status)
+			*status = hard_error ? IoStatus::IoError : IoStatus::NotFound;
 		return false;
+	}
+
+	if (!bte.val || bte.val_len < sizeof(j_inode_val_t))
+	{
+		if (status)
+			*status = IoStatus::IoError;
+		return false;
+	}
 
 	// const uint8_t *idata = reinterpret_cast<const uint8_t *>(bte.val);
 	const j_inode_val_t *obj = reinterpret_cast<const j_inode_val_t *>(bte.val);
@@ -223,36 +343,70 @@ bool ApfsDir::GetInode(ApfsDir::Inode& res, uint64_t inode)
 
 	if (bte.val_len > sizeof(j_inode_val_t))
 	{
-		const xf_blob_t *xf_hdr = reinterpret_cast<const xf_blob_t *>(obj->xfields);
-		const x_field_t *xf = reinterpret_cast<const x_field_t *>(xf_hdr->xf_data);
-		const uint8_t *xdata = obj->xfields + sizeof(xf_blob_t) + xf_hdr->xf_num_exts * sizeof(x_field_t);
-		uint16_t n;
+		const uint8_t *val_start = reinterpret_cast<const uint8_t *>(bte.val);
+		const uint8_t *val_end = val_start + bte.val_len;
+		const uint8_t *xf_base = val_start + offsetof(j_inode_val_t, xfields);
 
-		for (n = 0; n < xf_hdr->xf_num_exts; n++)
+		if (static_cast<size_t>(val_end - xf_base) < sizeof(xf_blob_t))
 		{
+			if (status)
+				*status = IoStatus::IoError;
+			return false;
+		}
+
+		const xf_blob_t *xf_hdr = reinterpret_cast<const xf_blob_t *>(xf_base);
+		const size_t xf_count = xf_hdr->xf_num_exts;
+		const size_t xf_avail = static_cast<size_t>(val_end - xf_base) - sizeof(xf_blob_t);
+
+		if (xf_count > xf_avail / sizeof(x_field_t))
+		{
+			if (status)
+				*status = IoStatus::IoError;
+			return false;
+		}
+
+		const x_field_t *xf = reinterpret_cast<const x_field_t *>(xf_hdr->xf_data);
+		const uint8_t *xdata = xf_base + sizeof(xf_blob_t) + xf_count * sizeof(x_field_t);
+
+		for (size_t n = 0; n < xf_count; n++)
+		{
+			const size_t xsize = xf[n].x_size;
+			const size_t padded = (xsize + 7) & ~static_cast<size_t>(7);
+
+			if (xdata > val_end || padded > static_cast<size_t>(val_end - xdata))
+			{
+				if (status)
+					*status = IoStatus::IoError;
+				return false;
+			}
+
 			switch (xf[n].x_type)
 			{
 			case INO_EXT_TYPE_SNAP_XID:
-				assert(xf[n].x_size == sizeof(uint64_t));
+				if (xsize != sizeof(uint64_t))
+					goto malformed;
 				res.snap_xid = bswap_le(*reinterpret_cast<const uint64_t *>(xdata));
 				res.optional_present_flags |= Inode::INO_HAS_SNAP_XID;
 				break;
 			case INO_EXT_TYPE_DELTRA_TREE_OID:
-				assert(xf[n].x_size == sizeof(uint64_t));
+				if (xsize != sizeof(uint64_t))
+					goto malformed;
 				res.delta_tree_oid = bswap_le(*reinterpret_cast<const uint64_t *>(xdata));
 				res.optional_present_flags |= Inode::INO_HAS_DELTA_TREE_OID;
 				break;
 			case INO_EXT_TYPE_DOCUMENT_ID:
-				assert(xf[n].x_size == sizeof(uint32_t));
+				if (xsize != sizeof(uint32_t))
+					goto malformed;
 				res.document_id = bswap_le(*reinterpret_cast<const uint32_t *>(xdata));
 				res.optional_present_flags |= Inode::INO_HAS_DOCUMENT_ID;
 				break;
 			case INO_EXT_TYPE_NAME:
-				res.name.assign(reinterpret_cast<const char *>(xdata), xf[n].x_size);
+				res.name.assign(reinterpret_cast<const char *>(xdata), xsize);
 				res.optional_present_flags |= Inode::INO_HAS_NAME;
 				break;
 			case INO_EXT_TYPE_PREV_FSIZE:
-				assert(xf[n].x_size == sizeof(uint64_t));
+				if (xsize != sizeof(uint64_t))
+					goto malformed;
 				res.prev_fsize = bswap_le(*reinterpret_cast<const uint64_t *>(xdata));
 				res.optional_present_flags |= Inode::INO_HAS_PREV_FSIZE;
 				break;
@@ -261,7 +415,8 @@ bool ApfsDir::GetInode(ApfsDir::Inode& res, uint64_t inode)
 				break;
 			case INO_EXT_TYPE_DSTREAM:
 			{
-				assert(xf[n].x_size == sizeof(j_dstream_t));
+				if (xsize != sizeof(j_dstream_t))
+					goto malformed;
 				const j_dstream_t *ds = reinterpret_cast<const j_dstream_t *>(xdata);
 				res.ds_size = ds->size;
 				res.ds_alloced_size = ds->alloced_size;
@@ -275,12 +430,14 @@ bool ApfsDir::GetInode(ApfsDir::Inode& res, uint64_t inode)
 				// TODO
 				break;
 			case INO_EXT_TYPE_FS_UUID:
-				assert(xf[n].x_size == sizeof(apfs_uuid_t));
+				if (xsize != sizeof(apfs_uuid_t))
+					goto malformed;
 				memcpy(res.fs_uuid, xdata, sizeof(apfs_uuid_t));
 				res.optional_present_flags |= Inode::INO_HAS_FS_UUID;
 				break;
 			case INO_EXT_TYPE_SPARSE_BYTES:
-				assert(xf[n].x_size == sizeof(uint64_t));
+				if (xsize != sizeof(uint64_t))
+					goto malformed;
 				res.sparse_bytes = bswap_le(*reinterpret_cast<const uint64_t *>(xdata));
 				res.optional_present_flags |= Inode::INO_HAS_SPARSE_BYTES;
 				break;
@@ -289,14 +446,19 @@ bool ApfsDir::GetInode(ApfsDir::Inode& res, uint64_t inode)
 				break;
 			}
 
-			xdata += ((xf[n].x_size + 7) & ~7);
+			xdata += padded;
 		}
 	}
 
 	return true;
+
+malformed:
+	if (status)
+		*status = IoStatus::IoError;
+	return false;
 }
 
-bool ApfsDir::ListDirectory(std::vector<DirRec> &dir, uint64_t inode)
+bool ApfsDir::ListDirectory(std::vector<DirRec> &dir, uint64_t inode, IoStatus *status)
 {
 	uint8_t skey_buf[0x500];
 
@@ -307,6 +469,9 @@ bool ApfsDir::ListDirectory(std::vector<DirRec> &dir, uint64_t inode)
 
 	const j_key_t *k;
 	const j_drec_val_t *v;
+
+	if (status)
+		*status = IoStatus::Ok;
 
 	skey = APFS_TYPE_ID(APFS_TYPE_DIR_REC, inode);
 
@@ -332,7 +497,11 @@ bool ApfsDir::ListDirectory(std::vector<DirRec> &dir, uint64_t inode)
 	}
 
 	if (!rc)
+	{
+		if (status)
+			*status = IoStatus::IoError;
 		return false;
+	}
 
 	for (;;)
 	{
@@ -341,6 +510,14 @@ bool ApfsDir::ListDirectory(std::vector<DirRec> &dir, uint64_t inode)
 		rc = it.GetEntry(bte);
 		if (!rc)
 			break;
+
+		if (bte.key_len < sizeof(j_key_t) || !bte.key || !bte.val)
+		{
+			if (status)
+				*status = IoStatus::IoError;
+			dir.clear();
+			return false;
+		}
 
 		if (g_debug & Dbg_Dir)
 		{
@@ -355,20 +532,77 @@ bool ApfsDir::ListDirectory(std::vector<DirRec> &dir, uint64_t inode)
 
 		e.parent_id = k->obj_id_and_type & OBJ_ID_MASK;
 
+		const uint8_t *name_ptr;
+		size_t name_len;
+
 		if (m_txt_fmt != 0)
 		{
+			const size_t name_off = offsetof(j_drec_hashed_key_t, name);
+			if (bte.key_len < name_off)
+			{
+				if (status)
+					*status = IoStatus::IoError;
+				dir.clear();
+				return false;
+			}
+
 			const j_drec_hashed_key_t *hk = reinterpret_cast<const j_drec_hashed_key_t *>(bte.key);
 			e.hash = hk->name_len_and_hash;
-			e.name = reinterpret_cast<const char *>(hk->name);
+			name_len = hk->name_len_and_hash & J_DREC_LEN_MASK;
+			name_ptr = hk->name;
+
+			if (name_len < 1 || name_len > bte.key_len - name_off)
+			{
+				if (status)
+					*status = IoStatus::IoError;
+				dir.clear();
+				return false;
+			}
 		}
 		else
 		{
+			const size_t name_off = offsetof(j_drec_key_t, name);
+			if (bte.key_len < name_off)
+			{
+				if (status)
+					*status = IoStatus::IoError;
+				dir.clear();
+				return false;
+			}
+
 			const j_drec_key_t *rk = reinterpret_cast<const j_drec_key_t *>(bte.key);
 			e.hash = 0;
-			e.name = reinterpret_cast<const char *>(rk->name);
+			name_len = rk->name_len;
+			name_ptr = rk->name;
+
+			if (name_len < 1 || name_len > bte.key_len - name_off)
+			{
+				if (status)
+					*status = IoStatus::IoError;
+				dir.clear();
+				return false;
+			}
 		}
 
+		if (name_ptr[name_len - 1] != 0)
+		{
+			if (status)
+				*status = IoStatus::IoError;
+			dir.clear();
+			return false;
+		}
+
+		e.name.assign(reinterpret_cast<const char *>(name_ptr), name_len - 1);
+
 		// assert(res.val_len == sizeof(APFS_Name));
+
+		if (bte.val_len < sizeof(j_drec_val_t))
+		{
+			if (status)
+				*status = IoStatus::IoError;
+			dir.clear();
+			return false;
+		}
 
 		v = reinterpret_cast<const j_drec_val_t *>(bte.val);
 
@@ -378,17 +612,56 @@ bool ApfsDir::ListDirectory(std::vector<DirRec> &dir, uint64_t inode)
 
 		if (bte.val_len > sizeof(j_drec_val_t))
 		{
-			const xf_blob_t *xf_hdr = reinterpret_cast<const xf_blob_t *>(v->xfields);
-			const x_field_t *xf = reinterpret_cast<const x_field_t *>(xf_hdr->xf_data);
-			const uint8_t *xdata = v->xfields + sizeof(xf_blob_t) + xf_hdr->xf_num_exts * sizeof(x_field_t);
-			uint16_t n;
+			const uint8_t *val_start = reinterpret_cast<const uint8_t *>(bte.val);
+			const uint8_t *val_end = val_start + bte.val_len;
+			const uint8_t *xf_base = val_start + offsetof(j_drec_val_t, xfields);
 
-			for (n = 0; n < xf_hdr->xf_num_exts; n++)
+			if (static_cast<size_t>(val_end - xf_base) < sizeof(xf_blob_t))
 			{
+				if (status)
+					*status = IoStatus::IoError;
+				dir.clear();
+				return false;
+			}
+
+			const xf_blob_t *xf_hdr = reinterpret_cast<const xf_blob_t *>(xf_base);
+			const size_t xf_count = xf_hdr->xf_num_exts;
+			const size_t xf_avail = static_cast<size_t>(val_end - xf_base) - sizeof(xf_blob_t);
+
+			if (xf_count > xf_avail / sizeof(x_field_t))
+			{
+				if (status)
+					*status = IoStatus::IoError;
+				dir.clear();
+				return false;
+			}
+
+			const x_field_t *xf = reinterpret_cast<const x_field_t *>(xf_hdr->xf_data);
+			const uint8_t *xdata = xf_base + sizeof(xf_blob_t) + xf_count * sizeof(x_field_t);
+
+			for (size_t n = 0; n < xf_count; n++)
+			{
+				const size_t xsize = xf[n].x_size;
+				const size_t padded = (xsize + 7) & ~static_cast<size_t>(7);
+
+				if (xdata > val_end || padded > static_cast<size_t>(val_end - xdata))
+				{
+					if (status)
+						*status = IoStatus::IoError;
+					dir.clear();
+					return false;
+				}
+
 				switch (xf[n].x_type)
 				{
 				case DREC_EXT_TYPE_SIBLING_ID:
-					assert(xf[n].x_size == sizeof(uint64_t));
+					if (xsize != sizeof(uint64_t))
+					{
+						if (status)
+							*status = IoStatus::IoError;
+						dir.clear();
+						return false;
+					}
 					e.sibling_id = bswap_le(*reinterpret_cast<const uint64_t *>(xdata));
 					e.has_sibling_id = true;
 					break;
@@ -397,7 +670,7 @@ bool ApfsDir::ListDirectory(std::vector<DirRec> &dir, uint64_t inode)
 					break;
 				}
 
-				xdata += ((xf[n].x_size + 7) & ~7);
+				xdata += padded;
 			}
 		}
 
@@ -406,18 +679,34 @@ bool ApfsDir::ListDirectory(std::vector<DirRec> &dir, uint64_t inode)
 		it.next();
 	}
 
+	if (it.HasError())
+	{
+		if (status)
+			*status = IoStatus::IoError;
+		dir.clear();
+		return false;
+	}
+
 	return true;
 }
 
-bool ApfsDir::LookupName(ApfsDir::DirRec& res, uint64_t parent_id, const char* name)
+bool ApfsDir::LookupName(ApfsDir::DirRec& res, uint64_t parent_id, const char* name, IoStatus *status)
 {
 	bool rc;
+	bool hard_error = false;
 	BTreeEntry e;
 	uint8_t srch_key_buf[0x500];
 	size_t name_len = strlen(name) + 1;
 
+	if (status)
+		*status = IoStatus::Ok;
+
 	if (name_len > 0x400)
+	{
+		if (status)
+			*status = IoStatus::NotFound;
 		return false;
+	}
 
 	res.parent_id = parent_id;
 	res.name = name;
@@ -436,7 +725,56 @@ bool ApfsDir::LookupName(ApfsDir::DirRec& res, uint64_t parent_id, const char* n
 		}
 		res.hash = skey->name_len_and_hash;
 
-		rc = m_fs_tree.Lookup(e, skey, sizeof(j_drec_hashed_key_t) + (skey->name_len_and_hash & J_DREC_LEN_MASK), CompareStdDirKey, this, true);
+		rc = m_fs_tree.Lookup(e, skey, sizeof(j_drec_hashed_key_t) + (skey->name_len_and_hash & J_DREC_LEN_MASK), CompareStdDirKey, this, true, &hard_error);
+
+		if (!rc)
+		{
+			if (hard_error)
+			{
+				if (status)
+					*status = IoStatus::IoError;
+				return false;
+			}
+
+			// The Unicode hash may not reproduce the on-disk hash for every
+			// code point. Fall back to an exact raw-byte scan of this
+			// directory, which is enough for names obtained from readdir.
+			// This deliberately does not alias case or normalization
+			// variants, and it is never used after an I/O failure.
+			std::vector<DirRec> entries;
+			IoStatus list_status = IoStatus::Ok;
+
+			if (!ListDirectory(entries, parent_id, &list_status))
+			{
+				if (status)
+					*status = (list_status == IoStatus::IoError) ? IoStatus::IoError : IoStatus::NotFound;
+				return false;
+			}
+
+			for (size_t k = 0; k < entries.size(); k++)
+			{
+				if (RawNameEquals(reinterpret_cast<const uint8_t *>(entries[k].name.data()),
+					static_cast<uint16_t>(entries[k].name.size() + 1), name))
+				{
+					log_unicode_fallback(parent_id, name);
+					res.hash = entries[k].hash;
+					res.parent_id = parent_id;
+					res.name = name;
+					res.file_id = entries[k].file_id;
+					res.date_added = entries[k].date_added;
+					res.sibling_id = entries[k].sibling_id;
+					res.flags = entries[k].flags;
+					res.has_sibling_id = entries[k].has_sibling_id;
+					if (status)
+						*status = IoStatus::Ok;
+					return true;
+				}
+			}
+
+			if (status)
+				*status = IoStatus::NotFound;
+			return false;
+		}
 	}
 	else
 	{
@@ -451,13 +789,22 @@ bool ApfsDir::LookupName(ApfsDir::DirRec& res, uint64_t parent_id, const char* n
 		}
 		res.hash = 0;
 
-		rc = m_fs_tree.Lookup(e, skey, sizeof(j_drec_key_t) + skey->name_len, CompareStdDirKey, this, true);
+		rc = m_fs_tree.Lookup(e, skey, sizeof(j_drec_key_t) + skey->name_len, CompareStdDirKey, this, true, &hard_error);
+
+		if (!rc)
+		{
+			if (g_debug & Dbg_Dir)
+				std::cout << "Lookup failed!" << std::endl;
+			if (status)
+				*status = hard_error ? IoStatus::IoError : IoStatus::NotFound;
+			return false;
+		}
 	}
 
-	if (!rc)
+	if (!e.key || e.val_len < sizeof(j_drec_val_t))
 	{
-		if (g_debug & Dbg_Dir)
-			std::cout << "Lookup failed!" << std::endl;
+		if (status)
+			*status = IoStatus::IoError;
 		return false;
 	}
 
@@ -465,6 +812,7 @@ bool ApfsDir::LookupName(ApfsDir::DirRec& res, uint64_t parent_id, const char* n
 
 	res.file_id = v->file_id;
 	res.date_added = v->date_added;
+	res.flags = v->flags;
 	// v->unk ?
 	// TODO: SIBLING-ID! XF!
 
@@ -474,129 +822,19 @@ bool ApfsDir::LookupName(ApfsDir::DirRec& res, uint64_t parent_id, const char* n
 	return true;
 }
 
-bool ApfsDir::ReadFile(void* data, uint64_t inode, uint64_t offs, size_t size)
+bool ApfsDir::ReadFile(void* data, uint64_t inode, uint64_t offs, size_t size,
+	IoStatus *status, uint64_t file_size)
 {
-	BTreeEntry e;
-	bool rc;
+	ExtentSourceImpl source(*this, inode);
+	const IoStatus result = ReadFileInternal(source, data, inode, offs, size, file_size);
 
-	uint8_t *bdata = reinterpret_cast<uint8_t *>(data);
+	if (status)
+		*status = result;
 
-	size_t cur_size;
-	uint64_t blk_idx;
-	uint64_t blk_offs;
-
-	uint64_t extent_size;
-	uint64_t extent_offs;
-	paddr_t extent_paddr;
-	uint64_t extent_crypto_id;
-
-	while (size > 0)
-	{
-		if (m_vol.isSealed()) {
-			fext_tree_key_t key;
-			const fext_tree_key_t *fext_key = nullptr;
-			const fext_tree_val_t *fext_val = nullptr;
-
-			key.private_id = inode;
-			key.logical_addr = offs;
-
-			rc = m_vol.fexttree().Lookup(e, &key, sizeof(key), CompareFextKey, this, false);
-			if (!rc) return false;
-
-			fext_key = reinterpret_cast<const fext_tree_key_t *>(e.key);
-			fext_val = reinterpret_cast<const fext_tree_val_t *>(e.val);
-
-			extent_offs = offs - fext_key->logical_addr;
-
-			extent_size = fext_val->len_and_flags & J_FILE_EXTENT_LEN_MASK;
-			extent_paddr = fext_val->phys_block_num;
-			extent_crypto_id = 0; /* TODO: Crypto on sealed volumes? Need later beta for that ... */
-		} else {
-			j_file_extent_key_t key;
-			const j_file_extent_key_t *ext_key = nullptr;
-			const j_file_extent_val_t *ext_val = nullptr;
-
-			key.hdr.obj_id_and_type = APFS_TYPE_ID(APFS_TYPE_FILE_EXTENT, inode);
-			key.logical_addr = offs;
-
-			if (g_debug & Dbg_Dir)
-				std::cout << "ReadFile(inode=" << inode << ",offs=" << offs << ",size=" << size << ")" << std::endl;
-
-			rc = m_fs_tree.Lookup(e, &key, sizeof(key), CompareStdDirKey, this, false);
-
-			if (!rc)
-				return false;
-
-			ext_key = reinterpret_cast<const j_file_extent_key_t *>(e.key);
-			ext_val = reinterpret_cast<const j_file_extent_val_t *>(e.val);
-
-			if (g_debug & Dbg_Dir)
-			{
-				std::cout << "FileExtent " << ext_key->hdr.obj_id_and_type << " " << ext_key->logical_addr << " => ";
-				std::cout << ext_val->len_and_flags << " " << ext_val->phys_block_num << " " << ext_val->crypto_id << std::endl;
-			}
-
-			if (ext_key->hdr.obj_id_and_type != key.hdr.obj_id_and_type)
-				return false;
-
-			// Remove flags from length member
-			extent_offs = offs - ext_key->logical_addr;
-
-			extent_size = ext_val->len_and_flags & J_FILE_EXTENT_LEN_MASK;
-			extent_paddr = ext_val->phys_block_num;
-			extent_crypto_id = ext_val->crypto_id;
-		}
-
-		blk_idx = extent_offs >> m_blksize_sh;
-		blk_offs = extent_offs & m_blksize_mask_lo;
-
-		cur_size = size;
-
-		if ((extent_offs + cur_size) > extent_size)
-			cur_size = extent_size - extent_offs;
-
-		if (cur_size == 0)
-			break;
-
-		if (extent_paddr != 0)
-		{
-			if (blk_offs == 0 && cur_size > m_blksize)
-				cur_size &= m_blksize_mask_hi;
-
-			if (blk_offs == 0 && (cur_size & m_blksize_mask_lo) == 0)
-			{
-				if (g_debug & Dbg_Dir)
-					std::cout << "Full read blk " << extent_paddr + blk_idx << " cnt " << (cur_size >> m_blksize_sh) << std::endl;
-				m_vol.ReadBlocks(bdata, extent_paddr + blk_idx, cur_size >> m_blksize_sh, extent_crypto_id + blk_idx);
-			}
-			else
-			{
-				if (g_debug & Dbg_Dir)
-					std::cout << "Partial read blk " << extent_paddr + blk_idx << " cnt 1" << std::endl;
-
-				m_vol.ReadBlocks(m_tmp_blk.data(), extent_paddr + blk_idx, 1, extent_crypto_id + blk_idx);
-
-				if (blk_offs + cur_size > m_blksize)
-					cur_size = m_blksize - blk_offs;
-
-				if (g_debug & Dbg_Dir)
-					std::cout << "Partial copy off " << blk_offs << " size " << cur_size << std::endl;
-
-				memcpy(bdata, m_tmp_blk.data() + blk_offs, cur_size);
-			}
-		}
-		else
-			memset(bdata, 0, cur_size);
-		bdata += cur_size;
-		offs += cur_size;
-		size -= cur_size;
-		// printf("ReadFile: offs=%016lX size=%016lX\n", offs, size);
-	}
-
-	return true;
+	return result == IoStatus::Ok;
 }
 
-bool ApfsDir::ListAttributes(std::vector<std::string>& names, uint64_t inode)
+bool ApfsDir::ListAttributes(std::vector<std::string>& names, uint64_t inode, IoStatus *status)
 {
 	j_inode_key_t skey;
 	const j_xattr_key_t *ekey;
@@ -604,17 +842,34 @@ bool ApfsDir::ListAttributes(std::vector<std::string>& names, uint64_t inode)
 	BTreeEntry res;
 	bool rc;
 
+	if (status)
+		*status = IoStatus::Ok;
+
+	names.clear();
+
 	skey.hdr.obj_id_and_type = APFS_TYPE_ID(APFS_TYPE_INODE, inode);
 
 	rc = m_fs_tree.GetIterator(it, &skey, sizeof(j_inode_key_t), CompareStdDirKey, this);
 	if (!rc)
+	{
+		if (status)
+			*status = IoStatus::IoError;
 		return false;
+	}
 
 	for (;;)
 	{
 		rc = it.GetEntry(res);
 		if (!rc)
 			break;
+
+		if (!res.key || res.key_len < sizeof(j_key_t))
+		{
+			if (status)
+				*status = IoStatus::IoError;
+			names.clear();
+			return false;
+		}
 
 		ekey = reinterpret_cast<const j_xattr_key_t *>(res.key);
 
@@ -630,15 +885,42 @@ bool ApfsDir::ListAttributes(std::vector<std::string>& names, uint64_t inode)
 		if ((ekey->hdr.obj_id_and_type >> OBJ_TYPE_SHIFT) > APFS_TYPE_XATTR)
 			break;
 
-		names.push_back(reinterpret_cast<const char *>(ekey->name));
+		if (res.key_len < sizeof(j_xattr_key_t))
+		{
+			if (status)
+				*status = IoStatus::IoError;
+			names.clear();
+			return false;
+		}
+
+		const size_t name_off = offsetof(j_xattr_key_t, name);
+		const size_t name_len = ekey->name_len;
+
+		if (name_len < 1 || name_len > res.key_len - name_off || ekey->name[name_len - 1] != 0)
+		{
+			if (status)
+				*status = IoStatus::IoError;
+			names.clear();
+			return false;
+		}
+
+		names.push_back(std::string(reinterpret_cast<const char *>(ekey->name), name_len - 1));
 
 		it.next();
+	}
+
+	if (it.HasError())
+	{
+		if (status)
+			*status = IoStatus::IoError;
+		names.clear();
+		return false;
 	}
 
 	return true;
 }
 
-bool ApfsDir::GetAttribute(std::vector<uint8_t>& data, uint64_t inode, const char* name)
+bool ApfsDir::GetAttribute(std::vector<uint8_t>& data, uint64_t inode, const char* name, IoStatus *status)
 {
 	uint8_t skey_buf[0x500];
 	j_xattr_key_t *skey = reinterpret_cast<j_xattr_key_t *>(skey_buf);
@@ -647,30 +929,67 @@ bool ApfsDir::GetAttribute(std::vector<uint8_t>& data, uint64_t inode, const cha
 
 	// const uint8_t *adata;
 	BTreeEntry res;
+	bool hard_error = false;
 	bool rc;
+
+	if (status)
+		*status = IoStatus::Ok;
+
+	data.clear();
 
 	size_t name_len = strlen(name) + 1;
 	if (name_len > 0x400)
+	{
+		if (status)
+			*status = IoStatus::NotFound;
 		return false;
+	}
 
 	skey->hdr.obj_id_and_type = APFS_TYPE_ID(APFS_TYPE_XATTR, inode);
 	skey->name_len = static_cast<int16_t>(name_len);
 	memcpy(skey->name, name, skey->name_len);
 
-	rc = m_fs_tree.Lookup(res, skey, sizeof(j_xattr_key_t) + skey->name_len, CompareStdDirKey, this, true);
+	rc = m_fs_tree.Lookup(res, skey, sizeof(j_xattr_key_t) + skey->name_len, CompareStdDirKey, this, true, &hard_error);
 	if (!rc)
+	{
+		if (status)
+			*status = hard_error ? IoStatus::IoError : IoStatus::NotFound;
 		return false;
+	}
+
+	if (!res.val || res.val_len < sizeof(j_xattr_val_t))
+	{
+		if (status)
+			*status = IoStatus::IoError;
+		return false;
+	}
 
 	attr = reinterpret_cast<const j_xattr_val_t *>(res.val);
 	// adata = reinterpret_cast<const uint8_t *>(res.val) + sizeof(APFS_Xattr_Val);
+
+	const size_t xdata_off = offsetof(j_xattr_val_t, xdata);
+	const size_t xdata_len = attr->xdata_len;
+
+	if (res.val_len < xdata_off || xdata_len > res.val_len - xdata_off)
+	{
+		if (status)
+			*status = IoStatus::IoError;
+		return false;
+	}
 
 	if (g_debug & Dbg_Dir)
 		std::cout << "GetAttribute: type=" << attr->flags << std::endl;
 
 	if (attr->flags & XATTR_DATA_STREAM)
 	{
+		if ((attr->flags & XATTR_DATA_EMBEDDED) || xdata_len != sizeof(j_xattr_dstream_t))
+		{
+			if (status)
+				*status = IoStatus::IoError;
+			return false;
+		}
+
 		// Attribute contents are stored in a file
-		assert(attr->xdata_len == sizeof(j_xattr_dstream_t));
 		xstm = reinterpret_cast<const j_xattr_dstream_t *>(attr->xdata);
 
 		if (g_debug & Dbg_Dir)
@@ -684,9 +1003,44 @@ bool ApfsDir::GetAttribute(std::vector<uint8_t>& data, uint64_t inode, const cha
 			std::cout << "  total_bytes_read  : " << xstm->dstream.total_bytes_read << std::endl;
 		}
 
-		data.resize(xstm->dstream.alloced_size);
-		ReadFile(data.data(), xstm->xattr_obj_id, 0, data.size()); // Read must be multiple of 4K ...
-		data.resize(xstm->dstream.size);
+		const uint64_t logical_size = xstm->dstream.size;
+		const uint64_t alloced_size = xstm->dstream.alloced_size;
+
+		if (logical_size > alloced_size)
+		{
+			if (status)
+				*status = IoStatus::IoError;
+			return false;
+		}
+
+		if (logical_size == 0)
+			return true;
+
+		try
+		{
+			data.resize(static_cast<size_t>(logical_size));
+		}
+		catch (const std::bad_alloc &)
+		{
+			if (status)
+				*status = IoStatus::IoError;
+			return false;
+		}
+		catch (const std::length_error &)
+		{
+			if (status)
+				*status = IoStatus::IoError;
+			return false;
+		}
+
+		IoStatus read_status = IoStatus::Ok;
+		if (!ReadFile(data.data(), xstm->xattr_obj_id, 0, data.size(), &read_status, logical_size))
+		{
+			if (status)
+				*status = IoStatus::IoError;
+			data.clear();
+			return false;
+		}
 
 		if (g_debug & Dbg_Dir)
 		{
@@ -699,13 +1053,19 @@ bool ApfsDir::GetAttribute(std::vector<uint8_t>& data, uint64_t inode, const cha
 	else if (attr->flags & XATTR_DATA_EMBEDDED)
 	{
 		// Attribute contents are stored in the btree
-		data.assign(attr->xdata, attr->xdata + attr->xdata_len);
+		data.assign(attr->xdata, attr->xdata + xdata_len);
+	}
+	else
+	{
+		if (status)
+			*status = IoStatus::IoError;
+		return false;
 	}
 
 	return true;
 }
 
-bool ApfsDir::GetAttributeInfo(ApfsDir::XAttr& attr, uint64_t inode, const char* name)
+bool ApfsDir::GetAttributeInfo(ApfsDir::XAttr& attr, uint64_t inode, const char* name, IoStatus *status)
 {
 	uint8_t skey_buf[0x500];
 	j_xattr_key_t *skey = reinterpret_cast<j_xattr_key_t *>(skey_buf);
@@ -713,26 +1073,62 @@ bool ApfsDir::GetAttributeInfo(ApfsDir::XAttr& attr, uint64_t inode, const char*
 	const j_xattr_dstream_t *xs = nullptr;
 
 	BTreeEntry res;
+	bool hard_error = false;
 	bool rc;
+
+	if (status)
+		*status = IoStatus::Ok;
 
 	size_t name_len = strlen(name) + 1;
 	if (name_len > 0x400)
+	{
+		if (status)
+			*status = IoStatus::NotFound;
 		return false;
+	}
 
 	skey->hdr.obj_id_and_type = APFS_TYPE_ID(APFS_TYPE_XATTR, inode);
 	skey->name_len = static_cast<int16_t>(name_len);
 	memcpy(skey->name, name, skey->name_len);
 
-	rc = m_fs_tree.Lookup(res, skey, sizeof(j_xattr_key_t) + skey->name_len, CompareStdDirKey, this, true);
+	rc = m_fs_tree.Lookup(res, skey, sizeof(j_xattr_key_t) + skey->name_len, CompareStdDirKey, this, true, &hard_error);
 	if (!rc)
+	{
+		if (status)
+			*status = hard_error ? IoStatus::IoError : IoStatus::NotFound;
 		return false;
+	}
+
+	if (!res.val || res.val_len < sizeof(j_xattr_val_t))
+	{
+		if (status)
+			*status = IoStatus::IoError;
+		return false;
+	}
 
 	xv = reinterpret_cast<const j_xattr_val_t *>(res.val);
+	const size_t xdata_off = offsetof(j_xattr_val_t, xdata);
+	const size_t xdata_len = xv->xdata_len;
+
+	if (res.val_len < xdata_off || xdata_len > res.val_len - xdata_off)
+	{
+		if (status)
+			*status = IoStatus::IoError;
+		return false;
+	}
+
 	attr.flags = xv->flags;
 	attr.xdata_len = xv->xdata_len;
 
 	if (xv->flags & XATTR_DATA_STREAM)
 	{
+		if ((xv->flags & XATTR_DATA_EMBEDDED) || xdata_len != sizeof(j_xattr_dstream_t))
+		{
+			if (status)
+				*status = IoStatus::IoError;
+			return false;
+		}
+
 		xs = reinterpret_cast<const j_xattr_dstream_t *>(xv->xdata);
 		attr.xstrm = *xs;
 	}

@@ -150,7 +150,7 @@ public:
 
 	bool Init(oid_t oid_root, xid_t xid, ApfsNodeMapper *omap = nullptr);
 
-	bool Lookup(BTreeEntry &result, const void *key, size_t key_size, BTCompareFunc func, void *context, bool exact);
+	bool Lookup(BTreeEntry &result, const void *key, size_t key_size, BTCompareFunc func, void *context, bool exact, bool *io_error = nullptr);
 	bool GetIterator(BTreeIterator &it, const void *key, size_t key_size, BTCompareFunc func, void *context);
 	bool GetIteratorBegin(BTreeIterator &it);
 
@@ -198,12 +198,17 @@ public:
 
 	bool GetEntry(BTreeEntry &res) const;
 
+	// True if iteration stopped because a node could not be loaded. A normal
+	// end of the tree leaves this false.
+	bool HasError() const { return m_error; }
+
 	void Setup(BTree *tree, const std::shared_ptr<BTreeNode> &node, uint32_t index);
 
 private:
 	BTree *m_tree;
 	std::shared_ptr<BTreeNode> m_node;
 	uint32_t m_index;
+	bool m_error;
 
 	std::shared_ptr<BTreeNode> next_node();
 };
