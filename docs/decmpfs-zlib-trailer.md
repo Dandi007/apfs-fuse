@@ -59,6 +59,8 @@ APFS 写端未开源，但 AppleFSCompression 的行为有可核验的原生抓�
 
 显式启用时使用 zlib `Z_BLOCK`，只有 `ret==Z_OK`、`(data_type & 0xC0)==0xC0`、`avail_in==0`、`total_out>0` 才接受缺尾：zlib 确认当前位置是最后一个 DEFLATE block 的结束边界。存在剩余输入时继续正常解码，要求完整正确的 Adler-32；部分 trailer 1–3 字节一律失败，不合成校验值。普通完整流仍以 Z_STREAM_END 成功，错误和无进展有界退出。
 
+语义与版本说明：本轮已在 zlib 1.3.1（本机 `ZLIB_VERSION`）上验证上述 `Z_BLOCK`/`data_type` 边界；这是已验证版本，不声明最低版本。若生产构建使用其他 zlib 版本，需按同一组边界用例单独复验，不能仅凭版本号推断行为一致。
+
 缺少生产者 checksum 的内容只有结构及调用方长度检查。合法编码内部的位翻转可能解出同长度错误内容；不能将解码成功或内容SHA称为独立完整性验证。真实21文件没有逐对象字节证据，不能宣称无损。
 
 ## 5. 修改范围
@@ -81,7 +83,7 @@ old implementation returned 0 for the native 86-byte block
 ### 6.2 正向结果
 
 - 原生黄金块解出 65536 字节，SHA-256 与抓包明文一致。
-- Debug 与 Release 全量 `ctest`（排除需要 FUSE/sudo 的 `reader-fuse`）：5 passed，`lookup-generation` skip；`zlib-decompress` 19 个用例全部通过，包含原有 10 个 fail-closed 用例。
+- Debug 与 Release 全量 `ctest`（排除需要 FUSE/sudo 的 `reader-fuse`）：5 passed，`lookup-generation` skip；`zlib-decompress` 22 个用例全部通过，包含原有 10 个 fail-closed 用例。
 - 负例全部返回 0 且在 2 秒保护内返回：原生块去掉 1..4 字节、原生块后追加 `00 00 00 00`、普通流截断、坏 Adler-32、输出缓冲少 1 字节、字典流、空输入。
 - 普通带 trailer 的流、trailing bytes、精确 64 KiB 输出仍逐字节与 SHA-256 一致。
 
@@ -97,7 +99,7 @@ old implementation returned 0 for the native 86-byte block
 
 - **type 3 inline zlib 未直接观测**：修复在函数级生效，但原生抓包只覆盖 type 4；同一 producer/encoder 的推断成立性未验证。现场 21 条 `dst_size=65536` 均为 type 4，不受影响。
 - **无 trailer 时无内容校验**：只能依赖调用方长度检查；这是磁盘格式的固有限制。
-- **resource fork 表未做越界校验**：`Decmpfs.cpp` 目前不检查 `src_offset + src_len` 是否落在 rsrc 内，属既有缺口，本 PR 不扩大范围，建议另开。
+- **resource fork 表越界校验**：本 PR 合入时 `Decmpfs.cpp` 尚未检查块数以及 `src_offset + src_len` 是否落在 rsrc 内，属既有缺口。已由后续独立 reader PR 补齐：类型 4 精确匹配 `ceil(size/64K)` 个块，表、offset、size 均在声明 data section 内校验，其余 rsrc 算法共享同一 fail-closed 解析边界。
 - **DMG 路径**：`DeviceDMG.cpp` 共用 `DecompressZLib`，默认严格校验不启用缺尾兼容，既有忽略返回值问题仍未处理。
 - **未对 21 个现场对象逐条取证**：按约束不访问生产挂载；结论基于“原生格式系统性 + 现场日志签名完全一致”，不是对每个对象的独立证明。
 
