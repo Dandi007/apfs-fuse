@@ -52,5 +52,12 @@ int main() {
     uint64_t key = 2;
     require(!tree.GetIteratorBegin(it), "uninitialized tree accepted");
     require(!tree.GetIterator(it, &key, sizeof(key), CompareStdKey, nullptr), "uninitialized search accepted");
+
+    BTreeEntry entry;
+    bool io_error = false;
+    require(!tree.Lookup(entry, &key, sizeof(key), CompareStdKey, nullptr, true, &io_error),
+            "uninitialized lookup accepted");
+    require(io_error, "uninitialized lookup must be reported as an I/O error");
+
     std::cout << "8 node layouts and empty-tree checks passed" << std::endl;
 }

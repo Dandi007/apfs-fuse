@@ -153,6 +153,15 @@ if (BUILD_TESTING)
   add_executable(btree-offset-test tests/BTreeOffsetTest.cpp)
   target_link_libraries(btree-offset-test apfs)
   add_test(NAME btree-offset COMMAND btree-offset-test)
+
+  add_executable(extent-reader-test tests/ExtentReaderTest.cpp)
+  target_link_libraries(extent-reader-test apfs)
+  add_test(NAME extent-reader COMMAND extent-reader-test)
+
+  add_executable(reader-policy-test tests/ReaderPolicyTest.cpp)
+  target_link_libraries(reader-policy-test apfs)
+  add_test(NAME reader-policy COMMAND reader-policy-test)
+
   add_test(NAME lookup-generation COMMAND sh ${CMAKE_SOURCE_DIR}/tests/lookup-generation.sh $<TARGET_FILE:apfs-fuse>)
   set_tests_properties(lookup-generation PROPERTIES SKIP_RETURN_CODE 77)
 endif()
