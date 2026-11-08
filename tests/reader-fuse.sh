@@ -66,9 +66,15 @@ FUSERMOUNT=$(command -v fusermount3 || command -v fusermount)
 
 # In restricted containers an unprivileged FUSE mount can be denied even
 # though /dev/fuse exists. Fall back to passwordless sudo when available.
-if [ "$(id -u)" -ne 0 ] && sudo -n true >/dev/null 2>&1; then
+# Set APFS_FUSE_USE_SUDO=0 to force a direct, sudo-free run (for an owner
+# validating as a regular user on a host where fusermount3 is permitted).
+if [ "${APFS_FUSE_USE_SUDO:-auto}" = "0" ]; then
+	APFS_FUSE_USE_SUDO=0 python3 -I \
+		"$(dirname "$0")/reader_fuse_test.py" "$BIN" "$WORK" "$FUSERMOUNT"
+elif [ "$(id -u)" -ne 0 ] && sudo -n true >/dev/null 2>&1; then
 	sudo -n env APFS_FUSE_USE_SUDO=1 python3 -I \
 		"$(dirname "$0")/reader_fuse_test.py" "$BIN" "$WORK" "$FUSERMOUNT"
 else
-	python3 -I "$(dirname "$0")/reader_fuse_test.py" "$BIN" "$WORK" "$FUSERMOUNT"
+	APFS_FUSE_USE_SUDO=0 python3 -I \
+		"$(dirname "$0")/reader_fuse_test.py" "$BIN" "$WORK" "$FUSERMOUNT"
 fi
