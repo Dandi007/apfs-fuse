@@ -22,24 +22,26 @@
 namespace
 {
 	const uint32_t BLOCK_SIZE = 4096;
-	const uint64_t IMAGE_SIZE = 64ULL * 1024 * 1024;
-	const uint32_t ROOT_PADDR = 0xAE;
+	const uint64_t IMAGE_SIZE = 128ULL * 1024 * 1024;
 	const uint64_t ROOT_OID = 0x403;
-	const uint32_t FIRST_NODE_PADDR = 0x100;
-	const uint32_t NODE_LIMIT_PADDR = 0x0F00;
-	const uint32_t OMAP_NODE_PADDR = 0x0F00;
+	// Keep synthetic nodes away from mkapfs's own metadata. Its layout differs
+	// between apfsprogs releases: at 128 MiB the 0.2.x tree puts the volume
+	// omap around paddr 0x13e, while Ubuntu 24.04's snapshot uses 0x44.
+	const uint32_t FIRST_NODE_PADDR = 0x4000;
+	const uint32_t NODE_LIMIT_PADDR = 0x5000;
+	const uint32_t OMAP_NODE_PADDR = 0x5000;
 	// Non-root fs-tree nodes are addressed by a virtual oid, the same way real
 	// APFS fs trees do it. The fixture's volume omap maps each oid to its
 	// physical block.
 	const uint64_t FS_NODE_OID_BASE = 0x800000;
 
-	const uint32_t DATA_22_A = 0x1000;
-	const uint32_t DATA_22_B = 0x1004;
-	const uint32_t DATA_23_A = 0x1010;
-	const uint32_t DATA_23_B = 0x1014;
-	const uint32_t DATA_9000 = 0x2200;
-	const uint32_t DATA_XATTR_64K = 0x2000;
-	const uint32_t DATA_XATTR_64K1 = 0x2100;
+	const uint32_t DATA_22_A = 0x6000;
+	const uint32_t DATA_22_B = 0x6004;
+	const uint32_t DATA_23_A = 0x6010;
+	const uint32_t DATA_23_B = 0x6014;
+	const uint32_t DATA_9000 = 0x7200;
+	const uint32_t DATA_XATTR_64K = 0x7000;
+	const uint32_t DATA_XATTR_64K1 = 0x7100;
 
 	struct BlockRef
 	{
@@ -484,7 +486,8 @@ namespace
 	}
 
 	bool BuildTree(std::vector<KeyVal> entries, std::vector<uint8_t> &image,
-		std::vector<BlockRef> &leaves, std::vector<BlockRef> &all_nodes, std::string &error)
+		uint32_t root_paddr, std::vector<BlockRef> &leaves,
+		std::vector<BlockRef> &all_nodes, std::string &error)
 	{
 		std::sort(entries.begin(), entries.end(), KeyLess);
 
@@ -569,14 +572,14 @@ namespace
 					// The last index node becomes the root, so its value
 					// offsets are measured from the btree_info area.
 					ref.oid = ROOT_OID;
-					ref.paddr = ROOT_PADDR;
+					ref.paddr = root_paddr;
 					if (!MakeNode(groups[g], level, false, true, ref.oid,
 						total_keys, 0, longest_key, longest_val, block))
 					{
 						error = "failed to build root";
 						return false;
 					}
-					std::memcpy(image.data() + static_cast<size_t>(ROOT_PADDR) * BLOCK_SIZE,
+					std::memcpy(image.data() + static_cast<size_t>(root_paddr) * BLOCK_SIZE,
 						block.data(), BLOCK_SIZE);
 					root_written = true;
 				}
@@ -627,11 +630,11 @@ namespace
 				error = "failed to build single-leaf root";
 				return false;
 			}
-			std::memcpy(image.data() + static_cast<size_t>(ROOT_PADDR) * BLOCK_SIZE,
+			std::memcpy(image.data() + static_cast<size_t>(root_paddr) * BLOCK_SIZE,
 				block.data(), BLOCK_SIZE);
 			BlockRef ref;
 			ref.oid = ROOT_OID;
-			ref.paddr = ROOT_PADDR;
+			ref.paddr = root_paddr;
 			ref.first_key = leaf_groups[0].front().key;
 			ref.last_key = leaf_groups[0].back().key;
 			refs[0] = ref;
@@ -1369,11 +1372,6 @@ bool CreateApfsFixture(const std::string &path, ApfsFixtureKind kind, std::strin
 		error = "file-system tree not mapped";
 		return false;
 	}
-	if (fs_tree_paddr != ROOT_PADDR)
-	{
-		error = "unexpected file-system tree location";
-		return false;
-	}
 
 	std::vector<KeyVal> entries;
 	std::vector<BlockRef> leaves;
@@ -1391,7 +1389,8 @@ bool CreateApfsFixture(const std::string &path, ApfsFixtureKind kind, std::strin
 		break;
 	}
 
-	if (!BuildTree(entries, image, leaves, all_nodes, error))
+	if (!BuildTree(entries, image, static_cast<uint32_t>(fs_tree_paddr),
+			leaves, all_nodes, error))
 		return false;
 
 	if (!WriteOmapTree(image, all_nodes, volume_xid, volume_omap_paddr, error))

@@ -135,7 +135,7 @@ FUSE 层：
 - `extent-reader-test`：用 `FakeSource` 注入场景，覆盖连续/非对齐读取、显式 `phys_block=0` hole、缺失 record 的 leading/trailing/gap（均 `IoError` 且不零填充）、lookup 失败不得零填充、设备读取失败/短读、零长度 extent、extent 起点在 offs 之后、`offs+size` 与 `logical+length` 溢出、EOF clamp、跨块读取的 crypto id。
 - `reader-policy-test`：覆盖 `getxattr` 的 size/ERANGE/64 KiB 边界、原始字节精确匹配（大小写、NFC/NFD、U+1F9E8）、压缩分类全部状态（含 `InvalidHeader`、`TooLarge`）、decmpfs header 解析。
 - `btree-offset-test`：保留原有 8 种节点布局检查，并新增“未初始化树查找必须报告 I/O error”。
-- `reader-integration-test`（T1）：用 mkapfs 0.2.1 生成 64 MiB 合法容器，重写 file-system tree，直接经 `ApfsContainer` / `ApfsVolume` / `ApfsDir` 读取。覆盖：
+- `reader-integration-test`（T1）：用 mkapfs 生成 128 MiB 合法容器（兼容 apfsprogs 0.2.1 与 Ubuntu 24.04 的 2023 快照），重写 file-system tree，直接经 `ApfsContainer` / `ApfsVolume` / `ApfsDir` 读取。覆盖：
   - 错 hash 的 U+1F9E8 文件名经原始字节回退命中；大小写和 NFC/NFD 变体保持 `NotFound`；缺失名字是 `NotFound` 而不是 `IoError`。
   - 坏节点：`GetInode`、`LookupName`、`ListDirectory`、`ListAttributes`、`ReadFile` 返回 `IoError`，进程不崩溃。
   - 显式 hole 返回零，缺失 record 的 gap 返回 `IoError`，越界设备读取返回 `IoError`，EOF 读取不触碰 buffer。
