@@ -14,6 +14,7 @@
 #include <cstring>
 #include <fstream>
 #include <sstream>
+#include <utility>
 #include <vector>
 
 #include <fcntl.h>
@@ -167,7 +168,8 @@ namespace
 		std::vector<uint8_t> val(4 + value.size(), 0);
 		WriteLE16(val, 0, XATTR_DATA_EMBEDDED);
 		WriteLE16(val, 2, static_cast<uint16_t>(value.size()));
-		std::memcpy(val.data() + 4, value.data(), value.size());
+		if (!value.empty())
+			std::memcpy(val.data() + 4, value.data(), value.size());
 		return val;
 	}
 
@@ -1124,6 +1126,66 @@ namespace
 		return true;
 	}
 
+	// Builds a type-4 resource fork whose data section is supplied verbatim.
+	// This lets the bounds tests declare a block count, table and data_size
+	// that disagree with the bytes actually present.
+	std::vector<uint8_t> MakeType4Carrier(uint32_t data_offset,
+		const std::vector<uint8_t> &data, uint32_t declared_size = UINT32_MAX)
+	{
+		const size_t declared = declared_size == UINT32_MAX ?
+			data.size() : static_cast<size_t>(declared_size);
+		std::vector<uint8_t> rsrc(data_offset +
+			std::max(data.size(), declared), 0);
+		WriteBE32(rsrc, 0, data_offset);
+		WriteBE32(rsrc, 4, 0);
+		WriteBE32(rsrc, 8, static_cast<uint32_t>(declared));
+		WriteBE32(rsrc, 12, 0);
+		if (!data.empty())
+			std::memcpy(rsrc.data() + data_offset, data.data(), data.size());
+		return rsrc;
+	}
+
+	std::vector<uint8_t> MakeType4Data(uint32_t entries,
+		const std::vector<std::pair<uint32_t, uint32_t> > &table,
+		const std::vector<uint8_t> &payload, uint32_t payload_off,
+		size_t min_size = 0)
+	{
+		// The data section starts four bytes before the table base: the
+		// reader's CmpfRsrc base is data_offset + 4, so bytes 0..3 are the
+		// leading le32 field, 4..7 the block count and 8.. the table.
+		size_t size = 8 + table.size() * 8;
+		if (!payload.empty())
+			size = std::max(size, static_cast<size_t>(4) + payload_off + payload.size());
+		size = std::max(size, min_size);
+
+		std::vector<uint8_t> data(size, 0);
+		WriteLE32(data, 4, entries);
+		for (size_t k = 0; k < table.size(); k++)
+		{
+			WriteLE32(data, 8 + k * 8, table[k].first);
+			WriteLE32(data, 12 + k * 8, table[k].second);
+		}
+		if (!payload.empty())
+			std::memcpy(data.data() + 4 + payload_off, payload.data(), payload.size());
+		return data;
+	}
+
+	// Builds an offset-table (algos 8/10/12/14) carrier from explicit offsets
+	// and a raw payload placed at a chosen offset.
+	std::vector<uint8_t> MakeOffsetCarrier(const std::vector<uint32_t> &offsets,
+		const std::vector<uint8_t> &payload, size_t payload_at)
+	{
+		size_t size = offsets.size() * 4;
+		if (!payload.empty())
+			size = std::max(size, payload_at + payload.size());
+		std::vector<uint8_t> rsrc(size, 0);
+		for (size_t k = 0; k < offsets.size(); k++)
+			WriteLE32(rsrc, k * 4, offsets[k]);
+		if (!payload.empty())
+			std::memcpy(rsrc.data() + payload_at, payload.data(), payload.size());
+		return rsrc;
+	}
+
 	// Four valid resource-fork compressed files: zlib and LZVN, each with one
 	// 64 KiB block and with two full blocks plus a non-integral tail. The
 	// single-block carriers stay embedded; the multi-block carriers are stored
@@ -1199,6 +1261,48 @@ namespace
 		return true;
 	}
 
+	// A valid type-4 carrier whose zlib block omits the four-byte Adler-32
+	// trailer. This is the producer form observed in the native capture and
+	// the positive control for the per-block validation diagnostic.
+	bool AddMissingAdlerRecord(std::vector<KeyVal> &entries, std::string &error)
+	{
+		std::vector<uint8_t> content;
+		FillRfContent(content, RfContentKind::ZlibSingle);
+
+		std::vector<uint8_t> payload = ZlibCompressBlock(content.data(),
+			content.size(), error);
+		if (payload.empty())
+			return false;
+		if (payload.size() < 8)
+		{
+			error = "rf-zlib-no-adler: compressed block too short";
+			return false;
+		}
+		payload.resize(payload.size() - 4);
+
+		const uint32_t table_end = 12; // count + one {offset, size}
+		std::vector<std::pair<uint32_t, uint32_t> > table;
+		table.push_back(std::make_pair(table_end,
+			static_cast<uint32_t>(payload.size())));
+		const std::vector<uint8_t> data = MakeType4Data(1, table, payload, table_end);
+		const std::vector<uint8_t> rsrc = MakeType4Carrier(0x100, data);
+
+		if (rsrc.size() > XATTR_EMBEDDED_MAX)
+		{
+			error = "rf-zlib-no-adler: carrier exceeds the embedded limit";
+			return false;
+		}
+
+		const uint64_t size = content.size();
+		AddDrec(entries, 2, "rf-zlib-no-adler", 67, DT_REG);
+		AddInode(entries, FileInode(67, "rf-zlib-no-adler", size, size,
+			APFS_UF_COMPRESSED, INODE_HAS_UNCOMPRESSED_SIZE, size));
+		AddEmbeddedXattr(entries, 67, "com.apple.decmpfs",
+			MakeDecmpfs(4, size, false));
+		AddEmbeddedXattr(entries, 67, "com.apple.ResourceFork", rsrc);
+		return true;
+	}
+
 	// Inline compression (algo 3) stores the whole zlib stream after the
 	// decmpfs header. One fixture decompresses correctly; two keep a valid
 	// zlib header but are truncated or corrupted inside the deflate payload,
@@ -1270,6 +1374,272 @@ namespace
 				APFS_UF_COMPRESSED, INODE_HAS_UNCOMPRESSED_SIZE, size));
 			AddEmbeddedXattr(entries, c.ino, "com.apple.decmpfs",
 				MakeDecmpfsWithPayload(3, size, payload));
+		}
+
+		return true;
+	}
+
+	// Malformed resource-fork tables. Every case is a real decmpfs attribute
+	// plus a real carrier, so the test drives DecompressFile() rather than a
+	// re-implementation of its parser. None of these may succeed or read past
+	// the carrier.
+	bool AddRfRecord(std::vector<KeyVal> &entries, uint64_t ino, const char *name,
+		uint32_t algo, uint64_t logical_size, const std::vector<uint8_t> &rsrc,
+		std::string &error)
+	{
+		if (rsrc.size() > XATTR_EMBEDDED_MAX)
+		{
+			error = std::string(name) + ": carrier exceeds the embedded limit";
+			return false;
+		}
+
+		AddDrec(entries, 2, name, ino, DT_REG);
+		AddInode(entries, FileInode(ino, name, logical_size, logical_size,
+			APFS_UF_COMPRESSED, INODE_HAS_UNCOMPRESSED_SIZE, logical_size));
+		AddEmbeddedXattr(entries, ino, "com.apple.decmpfs",
+			MakeDecmpfs(algo, logical_size, false));
+		AddEmbeddedXattr(entries, ino, "com.apple.ResourceFork", rsrc);
+		return true;
+	}
+
+	bool AddRfBoundsRecords(std::vector<KeyVal> &entries, std::string &error)
+	{
+		const std::vector<uint8_t> payload8(8, 0x5A);
+		const std::vector<uint8_t> payload16(16, 0x5A);
+
+		// Type 4: fewer table records than the logical size requires. The
+		// old loop stopped early and returned a zero-filled success.
+		{
+			const std::vector<uint8_t> data = MakeType4Data(1,
+				std::vector<std::pair<uint32_t, uint32_t> >{
+					std::make_pair(12u, 8u) }, payload8, 12);
+			if (!AddRfRecord(entries, 70, "rf-bad-few-blocks", 4,
+				3 * RF_BLOCK_SIZE, MakeType4Carrier(0x100, data), error))
+				return false;
+		}
+
+		// Type 4: more records than the logical size requires.
+		{
+			const std::vector<uint8_t> data = MakeType4Data(2,
+				std::vector<std::pair<uint32_t, uint32_t> >{
+					std::make_pair(20u, 8u), std::make_pair(28u, 8u) },
+				payload16, 20);
+			if (!AddRfRecord(entries, 71, "rf-bad-many-blocks", 4,
+				RF_BLOCK_SIZE, MakeType4Carrier(0x100, data), error))
+				return false;
+		}
+
+		// Type 4: the declared table does not fit in the declared data size.
+		{
+			std::vector<uint8_t> data(12, 0);
+			WriteLE32(data, 4, 1);
+			WriteLE32(data, 8, 12);
+			if (!AddRfRecord(entries, 72, "rf-bad-short-table", 4,
+				RF_BLOCK_SIZE, MakeType4Carrier(0x100, data), error))
+				return false;
+		}
+
+		// Type 4: a zero-length compressed block.
+		{
+			const std::vector<uint8_t> data = MakeType4Data(1,
+				std::vector<std::pair<uint32_t, uint32_t> >{
+					std::make_pair(12u, 0u) }, std::vector<uint8_t>(), 0, 16);
+			if (!AddRfRecord(entries, 73, "rf-bad-zero-block", 4,
+				RF_BLOCK_SIZE, MakeType4Carrier(0x100, data), error))
+				return false;
+		}
+
+		// Type 4: a record whose size runs past the data section.
+		{
+			const std::vector<uint8_t> data = MakeType4Data(1,
+				std::vector<std::pair<uint32_t, uint32_t> >{
+					std::make_pair(12u, 9u) }, payload8, 12);
+			if (!AddRfRecord(entries, 74, "rf-bad-block-size", 4,
+				RF_BLOCK_SIZE, MakeType4Carrier(0x100, data), error))
+				return false;
+		}
+
+		// Type 4: the second record overlaps the first one.
+		{
+			const std::vector<uint8_t> data = MakeType4Data(2,
+				std::vector<std::pair<uint32_t, uint32_t> >{
+					std::make_pair(28u, 8u), std::make_pair(20u, 8u) },
+				payload16, 20);
+			if (!AddRfRecord(entries, 75, "rf-bad-overlap", 4,
+				2 * RF_BLOCK_SIZE, MakeType4Carrier(0x100, data), error))
+				return false;
+		}
+
+		// Type 4: a record points into the count/table.
+		{
+			const std::vector<uint8_t> data = MakeType4Data(1,
+				std::vector<std::pair<uint32_t, uint32_t> >{
+					std::make_pair(0u, 8u) }, payload8, 12, 16);
+			if (!AddRfRecord(entries, 76, "rf-bad-table-pointer", 4,
+				RF_BLOCK_SIZE, MakeType4Carrier(0x100, data), error))
+				return false;
+		}
+
+		// Type 4: raw marker whose length is not expected + 1.
+		{
+			std::vector<uint8_t> raw(1024, 0x41);
+			raw[0] = 0xFF;
+			const std::vector<uint8_t> data = MakeType4Data(1,
+				std::vector<std::pair<uint32_t, uint32_t> >{
+					std::make_pair(12u, 1024u) }, raw, 12);
+			if (!AddRfRecord(entries, 77, "rf-bad-raw-length", 4,
+				1024, MakeType4Carrier(0x100, data), error))
+				return false;
+		}
+
+		// Type 4: data_offset leaves no room for the count.
+		{
+			std::vector<uint8_t> rsrc(20, 0);
+			WriteBE32(rsrc, 0, 18);
+			WriteBE32(rsrc, 8, 2);
+			if (!AddRfRecord(entries, 78, "rf-bad-data-offset", 4,
+				RF_BLOCK_SIZE, rsrc, error))
+				return false;
+		}
+
+		// Type 4: 4 GiB logical size with an empty table. The old
+		// (size + 0xFFFF) & 0xFFFF0000 mask wrapped this to zero.
+		{
+			const std::vector<uint8_t> data = MakeType4Data(0,
+				std::vector<std::pair<uint32_t, uint32_t> >(),
+				std::vector<uint8_t>(), 0, 8);
+			if (!AddRfRecord(entries, 79, "rf-bad-huge-size", 4,
+				0x100000000ULL, MakeType4Carrier(0x100, data), error))
+				return false;
+		}
+
+		// Type 4: zero logical size.
+		{
+			const std::vector<uint8_t> data = MakeType4Data(0,
+				std::vector<std::pair<uint32_t, uint32_t> >(),
+				std::vector<uint8_t>(), 0, 8);
+			if (!AddRfRecord(entries, 80, "rf-empty-size", 4,
+				0, MakeType4Carrier(0x100, data), error))
+				return false;
+		}
+
+		// Truncated and empty carriers.
+		{
+			const std::vector<uint8_t> short_rsrc(8, 0x11);
+			if (!AddRfRecord(entries, 81, "rf-bad-short-header", 4,
+				RF_BLOCK_SIZE, short_rsrc, error))
+				return false;
+			if (!AddRfRecord(entries, 82, "rf-bad-empty-carrier", 4,
+				RF_BLOCK_SIZE, std::vector<uint8_t>(), error))
+				return false;
+		}
+
+		// Algorithms 8/10/14 share the offset table. Short table, pointer
+		// into the table, zero-length block, offset past the carrier.
+		{
+			const std::vector<uint8_t> short_table = MakeOffsetCarrier(
+				std::vector<uint32_t>{ 8, 8 }, std::vector<uint8_t>(), 0);
+			if (!AddRfRecord(entries, 83, "rf-bad-off-table-short", 8,
+				2 * RF_BLOCK_SIZE, short_table, error))
+				return false;
+
+			const std::vector<uint8_t> table_pointer = MakeOffsetCarrier(
+				std::vector<uint32_t>{ 4, 8 }, std::vector<uint8_t>(), 0);
+			if (!AddRfRecord(entries, 84, "rf-bad-off-table-pointer", 8,
+				RF_BLOCK_SIZE, table_pointer, error))
+				return false;
+
+			const std::vector<uint8_t> zero_block = MakeOffsetCarrier(
+				std::vector<uint32_t>{ 8, 8 }, std::vector<uint8_t>(), 0);
+			if (!AddRfRecord(entries, 85, "rf-bad-off-zero", 8,
+				RF_BLOCK_SIZE, zero_block, error))
+				return false;
+
+			const std::vector<uint8_t> beyond = MakeOffsetCarrier(
+				std::vector<uint32_t>{ 8, 100 }, std::vector<uint8_t>(), 0);
+			if (!AddRfRecord(entries, 86, "rf-bad-off-beyond", 8,
+				RF_BLOCK_SIZE, beyond, error))
+				return false;
+		}
+
+		// Raw markers with the wrong length for LZVN (8), uncompressed (10)
+		// and LZBITMAP (14).
+		{
+			std::vector<uint8_t> raw(1024, 0x42);
+			raw[0] = 0x06;
+			const std::vector<uint8_t> lzvn = MakeOffsetCarrier(
+				std::vector<uint32_t>{ 8, 1032 }, raw, 8);
+			if (!AddRfRecord(entries, 87, "rf-bad-lzvn-raw-length", 8,
+				1024, lzvn, error))
+				return false;
+
+			const std::vector<uint8_t> plain = MakeOffsetCarrier(
+				std::vector<uint32_t>{ 8, 1032 }, raw, 8);
+			if (!AddRfRecord(entries, 88, "rf-bad-raw10-length", 10,
+				1024, plain, error))
+				return false;
+
+			raw[0] = 0xFF;
+			const std::vector<uint8_t> bitmap = MakeOffsetCarrier(
+				std::vector<uint32_t>{ 8, 1032 }, raw, 8);
+			if (!AddRfRecord(entries, 89, "rf-bad-raw14-length", 14,
+				1024, bitmap, error))
+				return false;
+		}
+
+		// A valid first block followed by a bad marker. The first block would
+		// otherwise produce a validation line; the whole object must fail
+		// without emitting it.
+		{
+			std::vector<uint8_t> content;
+			FillRfContent(content, RfContentKind::ZlibSingle);
+			std::vector<uint8_t> block0 = ZlibCompressBlock(content.data(),
+				content.size(), error);
+			if (block0.empty())
+				return false;
+
+			std::vector<uint8_t> payload = block0;
+			payload.push_back(0x00);
+			const uint32_t off0 = 20;
+			const uint32_t off1 = off0 + static_cast<uint32_t>(block0.size());
+			std::vector<std::pair<uint32_t, uint32_t> > table;
+			table.push_back(std::make_pair(off0,
+				static_cast<uint32_t>(block0.size())));
+			table.push_back(std::make_pair(off1, 1u));
+			const std::vector<uint8_t> data = MakeType4Data(2, table, payload, off0);
+			if (!AddRfRecord(entries, 90, "rf-bad-partial-decode", 4,
+				2 * RF_BLOCK_SIZE, MakeType4Carrier(0x100, data), error))
+				return false;
+		}
+
+		// Canonical resource layout: BE length prefix, bounded data section,
+		// followed by a distinct 50-byte map (not compressed payload).
+		{
+			std::vector<uint8_t> plain;
+			FillRfContent(plain, RfContentKind::ZlibSingle);
+			auto first = ZlibCompressBlock(plain.data(), plain.size(), error);
+			auto tail = ZlibCompressBlock(plain.data(), 12345, error);
+			if (first.empty() || tail.size() < 4) return false;
+			tail.resize(tail.size() - 4);
+			std::vector<uint8_t> payload = first;
+			payload.insert(payload.end(), tail.begin(), tail.end());
+			const uint32_t start = 24; // four bytes of padding after table
+			std::vector<std::pair<uint32_t, uint32_t>> table = {
+				{start, static_cast<uint32_t>(first.size())},
+				{start + static_cast<uint32_t>(first.size()), static_cast<uint32_t>(tail.size())}};
+			auto data = MakeType4Data(2, table, payload, start);
+			WriteBE32(data, 0, static_cast<uint32_t>(data.size() - 4));
+			auto carrier = MakeType4Carrier(0x100, data);
+			WriteBE32(carrier, 4, static_cast<uint32_t>(carrier.size()));
+			WriteBE32(carrier, 12, 50);
+			carrier.insert(carrier.end(), 50, 0xA5);
+			if (!AddRfRecord(entries, 91, "rf-canonical-mixed", 4,
+				RF_BLOCK_SIZE + 12345, carrier, error)) return false;
+			// Physically present map bytes must never satisfy a block range.
+			WriteLE32(carrier, 0x100 + 16, static_cast<uint32_t>(data.size() - 4));
+			WriteLE32(carrier, 0x100 + 20, 16);
+			if (!AddRfRecord(entries, 92, "rf-bad-map-block", 4,
+				RF_BLOCK_SIZE + 12345, carrier, error)) return false;
 		}
 
 		return true;
@@ -1391,6 +1761,8 @@ namespace
 		// Valid resource-fork compressed content (inode 26 above stays the
 		// deliberate invalid-carrier negative case).
 		if (!AddRfContentRecords(entries, writes, error))
+			return false;
+		if (!AddMissingAdlerRecord(entries, error))
 			return false;
 
 		return AddInlineZlibRecords(entries, error);
@@ -1716,6 +2088,10 @@ bool CreateApfsFixture(const std::string &path, ApfsFixtureKind kind, std::strin
 	{
 	case ApfsFixtureKind::Good:
 		if (!AddGoodRecords(entries, rf_writes, error))
+			return false;
+		// Malformed-carrier cases live only in the good image so they do not
+		// shift the high keys that the BadTree image deliberately corrupts.
+		if (!AddRfBoundsRecords(entries, error))
 			return false;
 		break;
 	case ApfsFixtureKind::BadTree:

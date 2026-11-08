@@ -17,10 +17,16 @@
 	along with apfs-fuse.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#include <iomanip>
-#include <iostream>
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
 #include <cstring>
-#include <cassert>
+#include <iostream>
+#include <limits>
+#include <new>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
 #include "Decmpfs.h"
 #include "Endian.h"
@@ -28,6 +34,8 @@
 #include "Global.h"
 #include "Util.h"
 
+namespace
+{
 
 struct RsrcForkHeader
 {
@@ -37,18 +45,322 @@ struct RsrcForkHeader
 	be_uint32_t mgmt_size;
 };
 
-struct CmpfRsrcEntry
+// One validated compressed block. Offsets are relative to the resource-fork
+// data base used by the type-4 table (data_offset + 4).
+struct RfBlockRecord
 {
-	// 1 64K-Block
-	le_uint32_t off;
-	le_uint32_t size;
+	size_t off;
+	size_t size;
 };
 
-struct CmpfRsrc
+constexpr size_t kDecmpfsBlockSize = 0x10000;
+constexpr size_t kDecmpfsMaxEncodedBlock = 0x10001;
+
+uint32_t ReadLE32(const uint8_t *p)
 {
-	le_uint32_t entries;
-	CmpfRsrcEntry entry[32];
-};
+	return static_cast<uint32_t>(p[0]) |
+		(static_cast<uint32_t>(p[1]) << 8) |
+		(static_cast<uint32_t>(p[2]) << 16) |
+		(static_cast<uint32_t>(p[3]) << 24);
+}
+
+void EmitLine(const std::string &line)
+{
+	if (line.empty())
+		return;
+	std::cerr.write(line.data(), static_cast<std::streamsize>(line.size()));
+	std::cerr.flush();
+}
+
+// Diagnostics are built completely before one write so a line cannot be
+// interleaved with another thread's output. Only stable identity and sizes
+// are printed: never a file name, path or payload byte.
+void EmitError(uint64_t ino, uint32_t algo, size_t block, const char *stage,
+	const char *reason)
+{
+	char line[256];
+	const int n = std::snprintf(line, sizeof(line),
+		"APFS_DECMPFS_ERROR ino=%llu algo=%u block=%zu stage=%s reason=%s\n",
+		static_cast<unsigned long long>(ino), algo, block, stage, reason);
+	if (n <= 0)
+		return;
+	const size_t len = std::min(sizeof(line) - 1, static_cast<size_t>(n));
+	std::cerr.write(line, static_cast<std::streamsize>(len));
+	std::cerr.flush();
+}
+
+std::string FormatValidation(uint64_t ino, uint32_t algo, size_t block,
+	size_t compressed, size_t expected, size_t decoded, bool missing_adler)
+{
+	char line[320];
+	const int n = std::snprintf(line, sizeof(line),
+		"APFS_DECMPFS_VALIDATION ino=%llu algo=%u block=%zu compressed=%zu"
+		" expected=%zu decoded=%zu validation=%s missing_adler=%u\n",
+		static_cast<unsigned long long>(ino), algo, block, compressed, expected,
+		decoded, missing_adler ? "structure_length_only" : "length_with_checksum",
+		missing_adler ? 1u : 0u);
+	if (n <= 0)
+		return std::string();
+	const size_t len = std::min(sizeof(line) - 1, static_cast<size_t>(n));
+	return std::string(line, len);
+}
+
+bool ResizeExact(std::vector<uint8_t> &out, uint64_t size, const char **reason)
+{
+	if (size > static_cast<uint64_t>(std::numeric_limits<size_t>::max()) ||
+		size > static_cast<uint64_t>(out.max_size()))
+	{
+		*reason = "size_range";
+		return false;
+	}
+
+	try
+	{
+		out.resize(static_cast<size_t>(size));
+	}
+	catch (const std::bad_alloc &)
+	{
+		*reason = "allocate";
+		return false;
+	}
+	catch (const std::length_error &)
+	{
+		*reason = "size_range";
+		return false;
+	}
+	return true;
+}
+
+bool BlockCount(uint64_t size, size_t &blocks, const char **reason)
+{
+	const uint64_t count = size / kDecmpfsBlockSize +
+		(size % kDecmpfsBlockSize != 0);
+	if (count > static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
+	{
+		*reason = "size_range";
+		return false;
+	}
+	blocks = static_cast<size_t>(count);
+	return true;
+}
+
+// Type-4 resource fork: a 16-byte classic header, then at data_offset a
+// little-endian payload. The payload starts with a block count and a table of
+// {offset, size} entries relative to data_offset + 4. The table has to
+// describe exactly ceil(logical_size / 64K) contiguous blocks inside the
+// declared data section; offsets into the count/table or outside the data
+// section are rejected before any pointer is formed.
+bool ParseType4Table(const std::vector<uint8_t> &rsrc, uint64_t logical_size,
+	size_t &base_out, std::vector<RfBlockRecord> &records, const char **reason)
+{
+	if (rsrc.size() < sizeof(RsrcForkHeader))
+	{
+		*reason = "rsrc_header_short";
+		return false;
+	}
+
+	RsrcForkHeader hdr;
+	std::memcpy(&hdr, rsrc.data(), sizeof(hdr));
+	const size_t data_offset = static_cast<uint32_t>(hdr.data_offset);
+	const size_t data_size = static_cast<uint32_t>(hdr.data_size);
+
+	if (data_offset > rsrc.size() || rsrc.size() - data_offset < 8)
+	{
+		*reason = "data_offset";
+		return false;
+	}
+	if (data_size < 8 || data_size > rsrc.size() - data_offset)
+	{
+		*reason = "data_size";
+		return false;
+	}
+	if (logical_size == 0)
+	{
+		*reason = "logical_size_zero";
+		return false;
+	}
+
+	size_t blocks = 0;
+	if (!BlockCount(logical_size, blocks, reason))
+		return false;
+
+	const size_t base = data_offset + 4;
+	const uint32_t entries = ReadLE32(rsrc.data() + base);
+	if (entries != blocks)
+	{
+		*reason = "block_count";
+		return false;
+	}
+
+	// data_size covers count (4), table (8*blocks) and payload. All arithmetic
+	// is subtraction-based so a wrapped size cannot look valid.
+	if (blocks > (std::numeric_limits<size_t>::max() - 4) / 8)
+	{
+		*reason = "table_size";
+		return false;
+	}
+	const size_t table_bytes = blocks * 8;
+	if (table_bytes > data_size - 8)
+	{
+		*reason = "table_short";
+		return false;
+	}
+	const size_t table_end = 4 + table_bytes; // relative to base
+
+	try
+	{
+		records.resize(blocks);
+	}
+	catch (const std::bad_alloc &)
+	{
+		*reason = "table_allocate";
+		return false;
+	}
+	catch (const std::length_error &)
+	{
+		*reason = "table_size";
+		return false;
+	}
+
+	// The data section is [base, data_offset + data_size); its relative end
+	// is data_size - 4. A block may not point into the count/table.
+	const size_t data_rel_size = data_size - 4;
+	size_t previous_end = table_end;
+
+	for (size_t k = 0; k < blocks; k++)
+	{
+		const uint8_t *entry = rsrc.data() + base + 4 + k * 8;
+		const size_t off = ReadLE32(entry);
+		const size_t size = ReadLE32(entry + 4);
+
+		if (size == 0)
+		{
+			*reason = "block_empty";
+			return false;
+		}
+		if (size > kDecmpfsMaxEncodedBlock)
+		{
+			*reason = "block_too_large";
+			return false;
+		}
+		if (off < table_end || off > data_rel_size)
+		{
+			*reason = "block_offset";
+			return false;
+		}
+		if (size > data_rel_size - off)
+		{
+			*reason = "block_size";
+			return false;
+		}
+		if (off < previous_end)
+		{
+			*reason = "block_overlap";
+			return false;
+		}
+
+		previous_end = off + size;
+		records[k].off = off;
+		records[k].size = size;
+	}
+
+	base_out = base;
+	return true;
+}
+
+// Algorithms 8/10/12/14 store a little-endian offset table at rsrc offset 0
+// with blocks + 1 entries. Validate the table, offsets and block lengths
+// before the decoder or a raw copy can touch the carrier.
+bool ParseOffsetTable(const std::vector<uint8_t> &rsrc, uint64_t logical_size,
+	std::vector<RfBlockRecord> &records, const char **reason)
+{
+	if (logical_size == 0)
+	{
+		*reason = "logical_size_zero";
+		return false;
+	}
+
+	size_t blocks = 0;
+	if (!BlockCount(logical_size, blocks, reason))
+		return false;
+
+	if (blocks > std::numeric_limits<size_t>::max() / 4 - 1)
+	{
+		*reason = "table_size";
+		return false;
+	}
+	const size_t table_bytes = (blocks + 1) * 4;
+	if (rsrc.size() < table_bytes)
+	{
+		*reason = "table_short";
+		return false;
+	}
+
+	const uint32_t first = ReadLE32(rsrc.data());
+	if (first < table_bytes)
+	{
+		*reason = "table_pointer";
+		return false;
+	}
+	if (first > rsrc.size())
+	{
+		*reason = "block_offset";
+		return false;
+	}
+
+	try
+	{
+		records.resize(blocks);
+	}
+	catch (const std::bad_alloc &)
+	{
+		*reason = "table_allocate";
+		return false;
+	}
+	catch (const std::length_error &)
+	{
+		*reason = "table_size";
+		return false;
+	}
+
+	uint32_t previous = first;
+	for (size_t k = 0; k < blocks; k++)
+	{
+		const uint32_t off = ReadLE32(rsrc.data() + k * 4);
+		const uint32_t next = ReadLE32(rsrc.data() + (k + 1) * 4);
+
+		if (off != previous)
+		{
+			*reason = "block_order";
+			return false;
+		}
+		if (next <= off)
+		{
+			*reason = "block_empty";
+			return false;
+		}
+		if (next > rsrc.size())
+		{
+			*reason = "block_offset";
+			return false;
+		}
+
+		const size_t size = static_cast<size_t>(next) - off;
+		if (size > kDecmpfsMaxEncodedBlock)
+		{
+			*reason = "block_too_large";
+			return false;
+		}
+
+		records[k].off = off;
+		records[k].size = size;
+		previous = next;
+	}
+
+	return true;
+}
+
+} // namespace
 
 bool IsDecompAlgoSupported(uint16_t algo)
 {
@@ -85,15 +397,33 @@ bool IsDecompAlgoInRsrc(uint16_t algo)
 	}
 }
 
-bool DecompressFile(ApfsDir &dir, uint64_t ino, std::vector<uint8_t> &decompressed, const std::vector<uint8_t> &compressed)
+bool DecompressFile(ApfsDir &dir, uint64_t ino, std::vector<uint8_t> &decompressed,
+	const std::vector<uint8_t> &compressed, DecompressResult *result)
 {
+	decompressed.clear();
+	if (result)
+		*result = DecompressResult();
+
 	if (compressed.size() < sizeof(CompressionHeader))
+	{
+		EmitError(ino, 0, 0, "header", "short");
 		return false;
+	}
 
 	const CompressionHeader *hdr = reinterpret_cast<const CompressionHeader *>(compressed.data());
+	const uint32_t algo = static_cast<uint32_t>(hdr->algo);
+	const uint64_t logical_size = static_cast<uint64_t>(hdr->size);
 	const uint8_t *cdata = compressed.data() + sizeof(CompressionHeader);
-	size_t csize = compressed.size() - sizeof(CompressionHeader);
-	size_t decoded_bytes = 0;
+	const size_t csize = compressed.size() - sizeof(CompressionHeader);
+
+	auto fail = [&](const char *stage, size_t block, const char *reason) -> bool {
+		EmitError(ino, algo, block, stage, reason);
+		decompressed.clear();
+		return false;
+	};
+
+	if (logical_size == 0)
+		return IsDecompAlgoSupported(algo) ? true : fail("header", 0, "unsupported_algo");
 
 #if 1 // Disable to get compressed data
 	if (g_debug & Dbg_Cmpfs)
@@ -124,7 +454,7 @@ bool DecompressFile(ApfsDir &dir, uint64_t ino, std::vector<uint8_t> &decompress
 			std::cout << "Unsupported decompression algorithm." << std::endl;
 			DumpHex(std::cout, compressed.data(), compressed.size());
 		}
-		return false;
+		return fail("algorithm", 0, "unsupported");
 	}
 
 	if (IsDecompAlgoInRsrc(hdr->algo))
@@ -135,155 +465,185 @@ bool DecompressFile(ApfsDir &dir, uint64_t ino, std::vector<uint8_t> &decompress
 		bool rc = dir.GetAttribute(rsrc, ino, "com.apple.ResourceFork");
 
 		if (!rc)
+			return fail("rsrc", 0, "missing");
+
+		std::vector<RfBlockRecord> records;
+		size_t base = 0;
+		const char *reason = nullptr;
+
+		if (hdr->algo == 4)
 		{
-			if (g_debug & Dbg_Errors)
-				std::cout << "Decmpfs: Could not find resource fork " << ino << std::endl;
-			decompressed.clear();
-			return false;
-		}
-
-		if (hdr->algo == 4) // Zlib, rsrc
-		{
-			RsrcForkHeader rsrc_hdr;
-
-			memcpy(&rsrc_hdr, rsrc.data(), sizeof(rsrc_hdr));
-
-			if (rsrc_hdr.data_offset > rsrc.size())
-			{
-				if (g_debug & Dbg_Errors)
-					std::cout << "Decmpfs: Invalid data offset in rsrc header." << std::endl;
-				return false;
-			}
-
-			const uint8_t *cmpf_rsrc_base = rsrc.data() + rsrc_hdr.data_offset + sizeof(uint32_t);
-			const CmpfRsrc *cmpf_rsrc = reinterpret_cast<const CmpfRsrc *>(cmpf_rsrc_base);
-
-			decompressed.resize((hdr->size + 0xFFFF) & 0xFFFF0000);
-
-			for (k = 0; k < cmpf_rsrc->entries; k++)
-			{
-				size_t src_offset = cmpf_rsrc->entry[k].off;
-				const uint8_t *src = cmpf_rsrc_base + src_offset;
-				size_t src_len = cmpf_rsrc->entry[k].size;
-				uint8_t *dst = decompressed.data() + 0x10000 * k;
-				size_t expected_len = hdr->size - (0x10000 * k);
-				if (expected_len > 0x10000)
-					expected_len = 0x10000;
-
-				if (src_len > 0x10001)
-				{
-					if (g_debug & Dbg_Errors)
-						std::cout << "Decmpfs: In rsrc, src_len too big (" << src_len << ")" << std::endl;
-					return false;
-				}
-
-				if (src[0] == 0x78)
-				{
-					decoded_bytes = DecompressZLib(dst, 0x10000, src, src_len, true);
-				}
-				else if ((src[0] & 0x0F) == 0x0F)
-				{
-					memcpy(dst, src + 1, src_len - 1);
-					decoded_bytes = src_len - 1;
-				}
-				else
-				{
-					if (g_debug & Dbg_Errors)
-						std::cout << "Decmpfs: Something wrong with zlib data." << std::endl;
-					decompressed.clear();
-					return false;
-				}
-
-				if (expected_len != decoded_bytes)
-				{
-					if (g_debug & Dbg_Errors)
-						std::cout << "Decmpfs: Expected len != decompressed len: " << expected_len << " != " << decoded_bytes << std::endl;
-					return false;
-				}
-			}
+			if (!ParseType4Table(rsrc, logical_size, base, records, &reason))
+				return fail("rsrc_table", 0, reason);
 		}
 		else
 		{
-			const uint32_t *off_list = reinterpret_cast<const uint32_t *>(rsrc.data());
+			if (!ParseOffsetTable(rsrc, logical_size, records, &reason))
+				return fail("rsrc_table", 0, reason);
+			base = 0;
+		}
 
-			decompressed.resize((hdr->size + 0xFFFF) & 0xFFFF0000);
+		if (!ResizeExact(decompressed, logical_size, &reason))
+			return fail("allocate", 0, reason);
 
-			for (k = 0; (k << 16) < decompressed.size(); k++) {
-				size_t expected_len = hdr->size - (0x10000 * k);
-				if (expected_len > 0x10000)
-					expected_len = 0x10000;
-				const uint8_t *src = rsrc.data() + off_list[k];
-				size_t src_len = off_list[k + 1] - off_list[k];
+		size_t zlib_blocks = 0;
+		size_t missing_blocks = 0;
+		std::vector<std::string> validation_lines;
 
-				if (src_len > 0x10001) {
-					if (g_debug & Dbg_Errors)
-						std::cout << "Decmpfs: In rsrc, src_len too big (" << src_len << ")" << std::endl;
-					return false;
+		for (k = 0; k < records.size(); k++)
+		{
+			const uint64_t logical_off = static_cast<uint64_t>(k) * kDecmpfsBlockSize;
+			const size_t expected = static_cast<size_t>(std::min<uint64_t>(
+				kDecmpfsBlockSize, logical_size - logical_off));
+			uint8_t *dst = decompressed.data() + static_cast<size_t>(logical_off);
+			const uint8_t *src = rsrc.data() + base + records[k].off;
+			const size_t src_len = records[k].size;
+			size_t decoded_bytes = 0;
+
+			if (hdr->algo == 4)
+			{
+				bool missing_adler = false;
+
+				if (src[0] == 0x78)
+				{
+					decoded_bytes = DecompressZLib(dst, expected, src, src_len,
+						true, &missing_adler);
+					zlib_blocks++;
+					if (missing_adler)
+						missing_blocks++;
+				}
+				else if ((src[0] & 0x0F) == 0x0F)
+				{
+					if (src_len != expected + 1)
+						return fail("block", k, "raw_marker_length");
+					std::memcpy(dst, src + 1, expected);
+					decoded_bytes = expected;
+				}
+				else
+				{
+					return fail("block", k, "block_marker");
 				}
 
+				if (decoded_bytes != expected)
+					return fail("block", k, "decoded_length");
+
+				if (src[0] == 0x78)
+				{
+					try
+					{
+						validation_lines.push_back(FormatValidation(ino, algo, k,
+							src_len, expected, decoded_bytes, missing_adler));
+					}
+					catch (const std::bad_alloc &)
+					{
+						return fail("allocate", k, "diagnostic");
+					}
+				}
+			}
+			else
+			{
 				switch (hdr->algo) {
 				case 8:
 					if (src[0] == 0x06) {
-						memcpy(decompressed.data() + (k << 16), src + 1, src_len - 1);
-						decoded_bytes = src_len - 1;
+						if (src_len != expected + 1)
+							return fail("block", k, "raw_marker_length");
+						std::memcpy(dst, src + 1, expected);
+						decoded_bytes = expected;
 					}
 					else
-						decoded_bytes = DecompressLZVN(decompressed.data() + (k << 16), expected_len, src, src_len);
+						decoded_bytes = DecompressLZVN(dst, expected, src, src_len);
 					break;
 				case 10:
-					// Assuming ...
-					memcpy(decompressed.data() + (k << 16), src + 1, src_len - 1);
-					decoded_bytes = src_len - 1;
+					if (src_len != expected + 1)
+						return fail("block", k, "raw_marker_length");
+					std::memcpy(dst, src + 1, expected);
+					decoded_bytes = expected;
 					break;
 				case 12:
-					// Assuming ...
-					decoded_bytes = DecompressLZFSE(decompressed.data() + (k << 16), expected_len, src, src_len);
-					// TODO is there also an uncompressed variant?
+					decoded_bytes = DecompressLZFSE(dst, expected, src, src_len);
 					break;
 				case 14:
 					if (src[0] == 0xFF) {
-						memcpy(decompressed.data() + (k << 16), src + 1, src_len - 1);
-						decoded_bytes = src_len - 1;
+						if (src_len != expected + 1)
+							return fail("block", k, "raw_marker_length");
+						std::memcpy(dst, src + 1, expected);
+						decoded_bytes = expected;
 					}
 					else
-						decoded_bytes = DecompressLZBITMAP(decompressed.data() + (k << 16), expected_len, src, src_len);
+						decoded_bytes = DecompressLZBITMAP(dst, expected, src, src_len);
 					break;
 				default:
-					decoded_bytes = 0;
-					break;
+					return fail("block", k, "unsupported");
 				}
 
-				if (decoded_bytes != expected_len) {
-					if (g_debug & Dbg_Errors)
-						std::cout << "Decmpfs: Expected length != decompressed length: " << expected_len << " != " << decoded_bytes << " [k = " << k << "]" << std::endl;
-
-					return false;
-				}
+				if (decoded_bytes != expected)
+					return fail("block", k, "decoded_length");
 			}
 		}
 
-		decompressed.resize(hdr->size);
+		// Emit per-block validation only after the whole object decoded, so a
+		// failure later in the object cannot leave a success-looking line.
+		for (size_t i = 0; i < validation_lines.size(); i++)
+			EmitLine(validation_lines[i]);
+
+		if (result)
+		{
+			result->accepted_missing_adler = missing_blocks != 0;
+			result->zlib_block_count = zlib_blocks;
+			result->missing_adler_block_count = missing_blocks;
+		}
 	}
 	else
 	{
-		decompressed.resize(hdr->size);
+		const char *reason = nullptr;
+		if (!ResizeExact(decompressed, logical_size, &reason))
+			return fail("allocate", 0, reason);
+
+		if (csize == 0)
+			return fail("inline", 0, "payload_short");
+
+		size_t decoded_bytes = 0;
 
 		switch (hdr->algo) {
 		case 3:
 			if (cdata[0] == 0x78)
-				decoded_bytes = DecompressZLib(decompressed.data(), decompressed.size(), cdata, csize, true);
+			{
+				bool missing_adler = false;
+				decoded_bytes = DecompressZLib(decompressed.data(), decompressed.size(),
+					cdata, csize, true, &missing_adler);
+				if (decoded_bytes == decompressed.size())
+				{
+					try
+					{
+						EmitLine(FormatValidation(ino, algo, 0, csize,
+							decompressed.size(), decoded_bytes, missing_adler));
+					}
+					catch (const std::bad_alloc &)
+					{
+						return fail("allocate", 0, "diagnostic");
+					}
+					if (result)
+					{
+						result->accepted_missing_adler = missing_adler;
+						result->zlib_block_count = 1;
+						result->missing_adler_block_count = missing_adler ? 1 : 0;
+					}
+				}
+			}
 			else if (cdata[0] == 0xFF) {
-				assert(hdr->size == csize - 1);
+				if (logical_size != csize - 1)
+					return fail("inline", 0, "raw_marker_length");
 				decompressed.assign(cdata + 1, cdata + csize);
 				decoded_bytes = decompressed.size();
 			}
 			else
-				return false;
+				return fail("inline", 0, "zlib_marker");
 			break;
 
 		case 7:
 			if (cdata[0] == 0x06) {
-				assert(hdr->size == csize - 1);
+				if (logical_size != csize - 1)
+					return fail("inline", 0, "raw_marker_length");
 				decompressed.assign(cdata + 1, cdata + csize);
 				decoded_bytes = decompressed.size();
 			}
@@ -292,8 +652,8 @@ bool DecompressFile(ApfsDir &dir, uint64_t ino, std::vector<uint8_t> &decompress
 			break;
 
 		case 9:
-			assert(cdata[0] == 0xCC);
-			assert(hdr->size == csize - 1);
+			if (cdata[0] != 0xCC || logical_size != csize - 1)
+				return fail("inline", 0, "raw_marker_length");
 			decompressed.assign(cdata + 1, cdata + csize);
 			decoded_bytes = decompressed.size();
 			break;
@@ -305,7 +665,8 @@ bool DecompressFile(ApfsDir &dir, uint64_t ino, std::vector<uint8_t> &decompress
 
 		case 13:
 			if (cdata[0] == 0xFF) {
-				assert(hdr->size == csize - 1);
+				if (logical_size != csize - 1)
+					return fail("inline", 0, "raw_marker_length");
 				decompressed.assign(cdata + 1, cdata + csize);
 				decoded_bytes = decompressed.size();
 			}
@@ -314,16 +675,11 @@ bool DecompressFile(ApfsDir &dir, uint64_t ino, std::vector<uint8_t> &decompress
 			break;
 
 		default:
-			decoded_bytes = 0;
-			break;
+			return fail("inline", 0, "unsupported");
 		}
 
-		if (decoded_bytes != hdr->size)
-		{
-			if (g_debug & Dbg_Errors)
-				std::cout << "Decmpfs: In attr, expected len != decoded len: " << hdr->size << " != " << decoded_bytes << std::endl;
-			return false;
-		}
+		if (decoded_bytes != logical_size)
+			return fail("inline", 0, "decoded_length");
 	}
 
 #else

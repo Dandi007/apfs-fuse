@@ -46,7 +46,12 @@ int StrCmpUtf8NormalizedFolded(const uint8_t *s1, const uint8_t *s2, bool case_f
 
 bool Utf8toUtf32(std::vector<char32_t> &str32, const uint8_t * str);
 
-size_t DecompressZLib(uint8_t *dst, size_t dst_size, const uint8_t *src, size_t src_size, bool allow_missing_adler = false);
+// allow_missing_adler is an explicit opt-in for producers that omit the
+// four-byte RFC 1950 trailer. missing_adler_out, if non-null, reports whether
+// this call completed through that boundary and therefore has no checksum
+// verification; it stays false on failure and for a normal Z_STREAM_END.
+size_t DecompressZLib(uint8_t *dst, size_t dst_size, const uint8_t *src, size_t src_size,
+	bool allow_missing_adler = false, bool *missing_adler_out = nullptr);
 size_t DecompressADC(uint8_t *dst, size_t dst_size, const uint8_t *src, size_t src_size);
 size_t DecompressLZVN(uint8_t *dst, size_t dst_size, const uint8_t *src, size_t src_size);
 size_t DecompressBZ2(uint8_t *dst, size_t dst_size, const uint8_t *src, size_t src_size);
