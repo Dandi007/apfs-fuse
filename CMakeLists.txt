@@ -96,13 +96,18 @@ add_library(apfs
 	ApfsLib/DiskImageFile.h
 	ApfsLib/DiskStruct.h
 	ApfsLib/Endian.h
+	ApfsLib/ExtentReader.cpp
+	ApfsLib/ExtentReader.h
 	ApfsLib/Global.h
 	ApfsLib/GptPartitionMap.cpp
 	ApfsLib/GptPartitionMap.h
+	ApfsLib/IoStatus.h
 	ApfsLib/KeyMgmt.cpp
 	ApfsLib/KeyMgmt.h
 	ApfsLib/PList.cpp
 	ApfsLib/PList.h
+	ApfsLib/ReaderPolicy.cpp
+	ApfsLib/ReaderPolicy.h
 	ApfsLib/Util.cpp
 	ApfsLib/Util.h
 	ApfsLib/Unicode.cpp

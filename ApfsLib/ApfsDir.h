@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "DiskStruct.h"
+#include "IoStatus.h"
 
 class BTree;
 class ApfsVolume;
@@ -123,16 +124,19 @@ public:
 	ApfsDir(ApfsVolume &vol);
 	~ApfsDir();
 
-	bool GetInode(Inode &res, uint64_t inode);
+	bool GetInode(Inode &res, uint64_t inode, IoStatus *status = nullptr);
 
-	bool ListDirectory(std::vector<DirRec> &dir, uint64_t inode);
-	bool LookupName(DirRec &res, uint64_t parent_id, const char *name);
-	bool ReadFile(void *data, uint64_t inode, uint64_t offs, size_t size);
-	bool ListAttributes(std::vector<std::string> &names, uint64_t inode);
-	bool GetAttribute(std::vector<uint8_t> &data, uint64_t inode, const char *name);
-	bool GetAttributeInfo(XAttr &attr, uint64_t inode, const char *name);
+	bool ListDirectory(std::vector<DirRec> &dir, uint64_t inode, IoStatus *status = nullptr);
+	bool LookupName(DirRec &res, uint64_t parent_id, const char *name, IoStatus *status = nullptr);
+	bool ReadFile(void *data, uint64_t inode, uint64_t offs, size_t size,
+		IoStatus *status = nullptr, uint64_t file_size = UINT64_MAX, bool sparse = false);
+	bool ListAttributes(std::vector<std::string> &names, uint64_t inode, IoStatus *status = nullptr);
+	bool GetAttribute(std::vector<uint8_t> &data, uint64_t inode, const char *name, IoStatus *status = nullptr);
+	bool GetAttributeInfo(XAttr &attr, uint64_t inode, const char *name, IoStatus *status = nullptr);
 
 private:
+	class ExtentSourceImpl;
+
 	static int CompareStdDirKey(const void *skey, size_t skey_len, const void *ekey, size_t ekey_len, void *context);
 	static int CompareFextKey(const void *skey, size_t skey_len, const void *ekey, size_t ekey_len, void *context);
 
@@ -140,8 +144,4 @@ private:
 	BTree &m_fs_tree;
 	uint32_t m_txt_fmt;
 	uint32_t m_blksize;
-	uint64_t m_blksize_mask_hi;
-	uint64_t m_blksize_mask_lo;
-	int m_blksize_sh;
-	std::vector<uint8_t> m_tmp_blk;
 };

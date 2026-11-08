@@ -206,10 +206,17 @@ bool BTree::Init(oid_t oid_root, xid_t xid, ApfsNodeMapper *omap)
 	}
 }
 
-bool BTree::Lookup(BTreeEntry &result, const void *key, size_t key_size, BTCompareFunc func, void *context, bool exact)
+bool BTree::Lookup(BTreeEntry &result, const void *key, size_t key_size, BTCompareFunc func, void *context, bool exact, bool *io_error)
 {
+	if (io_error)
+		*io_error = false;
+
 	if (!m_root_node)
+	{
+		if (io_error)
+			*io_error = true;
 		return false;
+	}
 
 	oid_t oid;
 	oid_t oid_parent;
@@ -232,16 +239,32 @@ bool BTree::Lookup(BTreeEntry &result, const void *key, size_t key_size, BTCompa
 		if (index < 0)
 			return false;
 
-		node->GetEntry(e, index);
+		if (!node->GetEntry(e, index))
+		{
+			if (io_error)
+				*io_error = true;
+			return false;
+		}
 		// DumpHex(std::cout, reinterpret_cast<const uint8_t*>(e.val), e.val_len, 32);
 
 		oid_parent = node->nodeid();
 
 		if (node->flags() & BTNODE_HASHED) {
+			if (e.val_len < sizeof(btn_index_node_val_t))
+			{
+				if (io_error)
+					*io_error = true;
+				return false;
+			}
 			const btn_index_node_val_t *binv = reinterpret_cast<const btn_index_node_val_t*>(e.val);
 			oid = binv->binv_child_oid + m_oid;
 		} else {
-			assert(e.val_len == sizeof(oid_t));
+			if (e.val_len != sizeof(oid_t))
+			{
+				if (io_error)
+					*io_error = true;
+				return false;
+			}
 			oid = *reinterpret_cast<const oid_t *>(e.val);
 		}
 
@@ -250,6 +273,8 @@ bool BTree::Lookup(BTreeEntry &result, const void *key, size_t key_size, BTCompa
 		if (!node)
 		{
 			std::cerr << "BTree::Lookup: Node " << oid << " with parent " << oid_parent << " not found." << std::endl;
+			if (io_error)
+				*io_error = true;
 			return false;
 		}
 	}
@@ -262,7 +287,12 @@ bool BTree::Lookup(BTreeEntry &result, const void *key, size_t key_size, BTCompa
 	if (index < 0)
 		return false;
 
-	node->GetEntry(result, index);
+	if (!node->GetEntry(result, index))
+	{
+		if (io_error)
+			*io_error = true;
+		return false;
+	}
 	result.m_node = node;
 
 	return true;
@@ -290,10 +320,13 @@ bool BTree::GetIterator(BTreeIterator& it, const void* key, size_t key_size, BTC
 		node->GetEntry(e, index);
 
 		if (node->flags() & BTNODE_HASHED) {
+			if (e.val_len < sizeof(btn_index_node_val_t))
+				return false;
 			const btn_index_node_val_t *binv = reinterpret_cast<const btn_index_node_val_t*>(e.val);
 			oid = binv->binv_child_oid + m_oid;
 		} else {
-			assert(e.val_len == sizeof(oid_t));
+			if (e.val_len != sizeof(oid_t))
+				return false;
 			oid = *reinterpret_cast<const oid_t *>(e.val);
 		}
 
@@ -308,6 +341,12 @@ bool BTree::GetIterator(BTreeIterator& it, const void* key, size_t key_size, BTC
 
 	if (index < 0)
 	{
+		if (node->entries_cnt() == 0)
+		{
+			it.Setup(this, node, 0);
+			return true;
+		}
+
 		index = node->entries_cnt() - 1;
 		it.Setup(this, node, index);
 		it.next();
@@ -343,9 +382,13 @@ bool BTree::GetIteratorBegin(BTreeIterator& it)
 			return false;
 
 		if (node->flags() & BTNODE_HASHED) {
+			if (e.val_len < sizeof(btn_index_node_val_t))
+				return false;
 			const btn_index_node_val_t *binv = reinterpret_cast<const btn_index_node_val_t*>(e.val);
 			oid = binv->binv_child_oid + m_oid;
 		} else {
+			if (e.val_len < sizeof(oid_t))
+				return false;
 			oid = *reinterpret_cast<const oid_t *>(e.val);
 		}
 		node = GetNode(oid, node, 0);
@@ -654,6 +697,7 @@ BTreeIterator::BTreeIterator()
 {
 	m_tree = nullptr;
 	m_index = 0;
+	m_error = false;
 }
 
 BTreeIterator::BTreeIterator(BTree *tree, const std::shared_ptr<BTreeNode> &node, uint32_t index)
@@ -661,6 +705,7 @@ BTreeIterator::BTreeIterator(BTree *tree, const std::shared_ptr<BTreeNode> &node
 	m_tree = tree;
 	m_node = node;
 	m_index = index;
+	m_error = false;
 }
 
 BTreeIterator::~BTreeIterator()
@@ -672,6 +717,7 @@ void BTreeIterator::Setup(BTree* tree, const std::shared_ptr<BTreeNode>& node, u
 	m_tree = tree;
 	m_node = node;
 	m_index = index;
+	m_error = false;
 }
 
 
@@ -754,7 +800,10 @@ std::shared_ptr<BTreeNode> BTreeIterator::next_node()
 		node = m_tree->GetNode(oid, node, pidx);
 
 		if (!node)
+		{
 			std::cerr << "Failed to load btree node oid " << oid << std::endl;
+			m_error = true;
+		}
 
 		pidx = 0;
 	}
