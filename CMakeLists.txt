@@ -168,8 +168,9 @@ if (BUILD_TESTING)
   target_link_libraries(zlib-decompress-test apfs crypto)
   add_test(NAME zlib-decompress COMMAND zlib-decompress-test)
 
-  add_library(apfs-fixture STATIC tests/ApfsFixture.cpp tests/ApfsFixture.h)
-  target_link_libraries(apfs-fixture apfs)
+  add_library(apfs-fixture STATIC tests/ApfsFixture.cpp tests/ApfsFixture.h
+    tests/RfContent.cpp tests/RfContent.h)
+  target_link_libraries(apfs-fixture apfs lzfse z)
 
   add_executable(reader-integration-test tests/ApfsReaderIntegrationTest.cpp)
   target_link_libraries(reader-integration-test apfs apfs-fixture)

@@ -4,6 +4,7 @@
 #include "ApfsLib/DiskStruct.h"
 #include "ApfsLib/ReaderPolicy.h"
 #include "ApfsLib/Util.h"
+#include "RfContent.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -18,6 +19,13 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <zlib.h>
+
+// The LZFSE library only exposes its LZVN encoder through internal headers.
+// Linkage is C, matching lzvn_encode_base.c.
+extern "C" size_t lzvn_encode_buffer(void *dst, size_t dst_size, const void *src,
+	size_t src_size, void *work);
+extern "C" size_t lzvn_encode_scratch_size(void);
 
 namespace
 {
@@ -42,6 +50,16 @@ namespace
 	const uint32_t DATA_9000 = 0x7200;
 	const uint32_t DATA_XATTR_64K = 0x7000;
 	const uint32_t DATA_XATTR_64K1 = 0x7100;
+
+	// Resource-fork carrier dstreams for the multi-block compressed fixtures.
+	const uint32_t DATA_RF_ZLIB_STREAM = 0x7300;
+	const uint32_t DATA_RF_LZVN_STREAM = 0x7340;
+	const uint32_t RF_STREAM_MAX_BLOCKS = 64;
+	const uint64_t RF_ZLIB_STREAM_OBJ = 0x3100;
+	const uint64_t RF_LZVN_STREAM_OBJ = 0x3101;
+
+	// APFS stores xattr values above this size in a dstream, not embedded.
+	const size_t XATTR_EMBEDDED_MAX = 3802;
 
 	struct BlockRef
 	{
@@ -88,6 +106,12 @@ namespace
 	{
 		for (int k = 0; k < 4; k++)
 			buf[off + k] = static_cast<uint8_t>(value >> (8 * k));
+	}
+
+	void WriteBE32(std::vector<uint8_t> &buf, size_t off, uint32_t value)
+	{
+		for (int k = 0; k < 4; k++)
+			buf[off + k] = static_cast<uint8_t>(value >> (8 * (3 - k)));
 	}
 
 	void WriteLE64(std::vector<uint8_t> &buf, size_t off, uint64_t value)
@@ -283,6 +307,17 @@ namespace
 			for (size_t k = 0; k < size; k++)
 				data.push_back(static_cast<uint8_t>('A' + (k % 26)));
 		}
+		return data;
+	}
+
+	std::vector<uint8_t> MakeDecmpfsWithPayload(uint32_t algo, uint64_t size,
+		const std::vector<uint8_t> &payload)
+	{
+		std::vector<uint8_t> data(sizeof(CompressionHeader), 0);
+		WriteLE32(data, 0, DECMPFS_MAGIC);
+		WriteLE32(data, 4, algo);
+		WriteLE64(data, 8, size);
+		data.insert(data.end(), payload.begin(), payload.end());
 		return data;
 	}
 
@@ -952,6 +987,294 @@ namespace
 		return spec;
 	}
 
+	struct RfCarrierWrite
+	{
+		uint32_t paddr;
+		std::vector<uint8_t> data;
+	};
+
+	std::vector<uint8_t> ZlibCompressBlock(const uint8_t *src, size_t size,
+		std::string &error)
+	{
+		uLongf out_size = compressBound(static_cast<uLong>(size));
+		std::vector<uint8_t> out(static_cast<size_t>(out_size));
+		const int rc = compress2(out.data(), &out_size, src,
+			static_cast<uLong>(size), 9);
+		if (rc != Z_OK)
+		{
+			error = "zlib compression failed";
+			out.clear();
+			return out;
+		}
+		out.resize(static_cast<size_t>(out_size));
+		if (out.empty() || out[0] != 0x78)
+		{
+			error = "zlib block does not start with 0x78";
+			out.clear();
+		}
+		return out;
+	}
+
+	std::vector<uint8_t> LzvnCompressBlock(const uint8_t *src, size_t size,
+		std::string &error)
+	{
+		std::vector<uint8_t> work(lzvn_encode_scratch_size());
+		std::vector<uint8_t> out(size + 1024);
+		const size_t out_size = lzvn_encode_buffer(out.data(), out.size(), src,
+			size, work.data());
+		if (out_size == 0)
+		{
+			error = "LZVN compression failed";
+			out.clear();
+			return out;
+		}
+		out.resize(out_size);
+		if (out[0] == 0x06)
+		{
+			// 0x06 is the raw-block marker; a compressed stream must not be
+			// mistaken for one by the reader.
+			error = "LZVN stream starts with the raw marker";
+			out.clear();
+		}
+		return out;
+	}
+
+	// Builds the on-disk resource fork exactly as Decmpfs::DecompressFile()
+	// expects it.
+	//   algo 4 (zlib): classic resource-fork header (big-endian) at offset 0,
+	//     then at data_offset a le32 'unknown', le32 block count and a table of
+	//     {le32 offset, le32 size} relative to data_offset + 4.
+	//   algo 8 (LZVN): a le32 offset table at offset 0, with one extra entry
+	//     for the end of the last block; each block follows the table.
+	bool BuildRsrcCarrier(RfContentKind kind, uint16_t algo,
+		std::vector<uint8_t> &rsrc, uint32_t &block_count, std::string &error)
+	{
+		std::vector<uint8_t> content;
+		FillRfContent(content, kind);
+
+		const size_t blocks = (content.size() + RF_BLOCK_SIZE - 1) / RF_BLOCK_SIZE;
+		std::vector<std::vector<uint8_t> > encoded(blocks);
+
+		for (size_t k = 0; k < blocks; k++)
+		{
+			const size_t begin = k * static_cast<size_t>(RF_BLOCK_SIZE);
+			const size_t end = std::min<size_t>(content.size(),
+				begin + static_cast<size_t>(RF_BLOCK_SIZE));
+			if (algo == 4)
+				encoded[k] = ZlibCompressBlock(content.data() + begin, end - begin, error);
+			else
+				encoded[k] = LzvnCompressBlock(content.data() + begin, end - begin, error);
+			if (encoded[k].empty())
+				return false;
+			if (encoded[k].size() > 0x10001)
+			{
+				error = "compressed block exceeds the reader limit";
+				return false;
+			}
+		}
+
+		block_count = static_cast<uint32_t>(blocks);
+
+		size_t payload = 0;
+		for (size_t k = 0; k < blocks; k++)
+			payload += encoded[k].size();
+
+		if (algo == 4)
+		{
+			const size_t data_offset = 0x100;
+			rsrc.assign(data_offset + 8 + blocks * 8 + payload, 0);
+
+			// Resource fork header. Only data_offset is read by the reader;
+			// the remaining fields mirror the usual on-disk values.
+			WriteBE32(rsrc, 0, static_cast<uint32_t>(data_offset));
+			WriteBE32(rsrc, 4, 0);
+			WriteBE32(rsrc, 8, static_cast<uint32_t>(rsrc.size() - data_offset));
+			WriteBE32(rsrc, 12, 0);
+
+			WriteLE32(rsrc, data_offset, 0);
+			WriteLE32(rsrc, data_offset + 4, block_count);
+
+			size_t cursor = data_offset + 8 + blocks * 8;
+			uint32_t rel = static_cast<uint32_t>(4 + blocks * 8);
+			for (size_t k = 0; k < blocks; k++)
+			{
+				WriteLE32(rsrc, data_offset + 8 + k * 8, rel);
+				WriteLE32(rsrc, data_offset + 12 + k * 8,
+					static_cast<uint32_t>(encoded[k].size()));
+				std::memcpy(rsrc.data() + cursor, encoded[k].data(), encoded[k].size());
+				cursor += encoded[k].size();
+				rel += static_cast<uint32_t>(encoded[k].size());
+			}
+		}
+		else
+		{
+			rsrc.assign((blocks + 1) * 4 + payload, 0);
+			uint32_t offset = static_cast<uint32_t>((blocks + 1) * 4);
+			size_t cursor = offset;
+			for (size_t k = 0; k < blocks; k++)
+			{
+				WriteLE32(rsrc, k * 4, offset);
+				std::memcpy(rsrc.data() + cursor, encoded[k].data(), encoded[k].size());
+				cursor += encoded[k].size();
+				offset += static_cast<uint32_t>(encoded[k].size());
+			}
+			WriteLE32(rsrc, blocks * 4, offset);
+		}
+
+		return true;
+	}
+
+	// Four valid resource-fork compressed files: zlib and LZVN, each with one
+	// 64 KiB block and with two full blocks plus a non-integral tail. The
+	// single-block carriers stay embedded; the multi-block carriers are stored
+	// as dstreams, like a real large resource fork.
+	bool AddRfContentRecords(std::vector<KeyVal> &entries,
+		std::vector<RfCarrierWrite> &writes, std::string &error)
+	{
+		struct Case
+		{
+			uint64_t ino;
+			const char *name;
+			RfContentKind kind;
+			uint16_t algo;
+			bool stream;
+			uint32_t paddr;
+			uint64_t obj_id;
+		};
+
+		const Case cases[] = {
+			{60, "rf-zlib-1blk", RfContentKind::ZlibSingle, 4, false, 0, 0},
+			{61, "rf-zlib-multi", RfContentKind::ZlibMulti, 4, true,
+				DATA_RF_ZLIB_STREAM, RF_ZLIB_STREAM_OBJ},
+			{62, "rf-lzvn-1blk", RfContentKind::LzvnSingle, 8, false, 0, 0},
+			{63, "rf-lzvn-multi", RfContentKind::LzvnMulti, 8, true,
+				DATA_RF_LZVN_STREAM, RF_LZVN_STREAM_OBJ},
+		};
+
+		for (size_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++)
+		{
+			const Case &c = cases[k];
+			std::vector<uint8_t> rsrc;
+			uint32_t blocks = 0;
+			if (!BuildRsrcCarrier(c.kind, c.algo, rsrc, blocks, error))
+				return false;
+
+			const uint64_t size = RfContentSize(c.kind);
+
+			AddDrec(entries, 2, c.name, c.ino, DT_REG);
+			AddInode(entries, FileInode(c.ino, c.name, 0, 0, APFS_UF_COMPRESSED,
+				INODE_HAS_UNCOMPRESSED_SIZE, size));
+			AddEmbeddedXattr(entries, c.ino, "com.apple.decmpfs",
+				MakeDecmpfs(c.algo, size, false));
+
+			if (c.stream)
+			{
+				const size_t alloced = (rsrc.size() + BLOCK_SIZE - 1) &
+					~(static_cast<size_t>(BLOCK_SIZE) - 1);
+				if (alloced > RF_STREAM_MAX_BLOCKS * BLOCK_SIZE)
+				{
+					error = "resource-fork dstream exceeds fixture space";
+					return false;
+				}
+				AddStreamXattr(entries, c.ino, "com.apple.ResourceFork", c.obj_id,
+					rsrc.size(), alloced);
+				AddExtent(entries, c.obj_id, 0, alloced, c.paddr);
+
+				RfCarrierWrite write;
+				write.paddr = c.paddr;
+				write.data = rsrc;
+				writes.push_back(write);
+			}
+			else
+			{
+				if (rsrc.size() > XATTR_EMBEDDED_MAX)
+				{
+					error = "embedded resource-fork carrier exceeds 3802 bytes";
+					return false;
+				}
+				AddEmbeddedXattr(entries, c.ino, "com.apple.ResourceFork", rsrc);
+			}
+		}
+
+		return true;
+	}
+
+	// Inline compression (algo 3) stores the whole zlib stream after the
+	// decmpfs header. One fixture decompresses correctly; two keep a valid
+	// zlib header but are truncated or corrupted inside the deflate payload,
+	// so the reader must fail closed instead of hanging or returning partial
+	// bytes.
+	bool AddInlineZlibRecords(std::vector<KeyVal> &entries, std::string &error)
+	{
+		struct Case
+		{
+			uint64_t ino;
+			const char *name;
+			RfContentKind kind;
+		};
+
+		const Case cases[] = {
+			{64, "inline-zlib", RfContentKind::ZlibInline},
+			{65, "inline-zlib-truncated", RfContentKind::ZlibInlineTruncated},
+			{66, "inline-zlib-corrupt", RfContentKind::ZlibInlineCorrupt},
+		};
+
+		for (size_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++)
+		{
+			const Case &c = cases[k];
+			const std::string label = c.name;
+			const uint64_t size = RfContentSize(c.kind);
+
+			std::vector<uint8_t> content;
+			FillRfContent(content, c.kind);
+
+			std::string zerr;
+			std::vector<uint8_t> payload = ZlibCompressBlock(content.data(),
+				content.size(), zerr);
+			if (payload.empty())
+			{
+				error = label + ": " + zerr;
+				return false;
+			}
+
+			if (c.kind == RfContentKind::ZlibInlineTruncated)
+			{
+				if (payload.size() < 32)
+				{
+					error = label + ": compressed stream too short to truncate";
+					return false;
+				}
+				payload.resize(payload.size() - 16);
+			}
+			else if (c.kind == RfContentKind::ZlibInlineCorrupt)
+			{
+				if (payload.size() < 8)
+				{
+					error = label + ": compressed stream too short to corrupt";
+					return false;
+				}
+				// Keep the 0x78 zlib header so Decmpfs still dispatches to
+				// DecompressZLib, then set the first deflate block type to
+				// the reserved value 3, which inflate() rejects immediately.
+				payload[2] = (payload[2] & 0xF9) | 0x06;
+			}
+
+			if (sizeof(CompressionHeader) + payload.size() > XATTR_EMBEDDED_MAX)
+			{
+				error = label + ": inline zlib payload exceeds the embedded limit";
+				return false;
+			}
+
+			AddDrec(entries, 2, c.name, c.ino, DT_REG);
+			AddInode(entries, FileInode(c.ino, c.name, size, size,
+				APFS_UF_COMPRESSED, INODE_HAS_UNCOMPRESSED_SIZE, size));
+			AddEmbeddedXattr(entries, c.ino, "com.apple.decmpfs",
+				MakeDecmpfsWithPayload(3, size, payload));
+		}
+
+		return true;
+	}
+
 	void AddBaseInodes(std::vector<KeyVal> &entries)
 	{
 		InodeSpec root;
@@ -980,7 +1303,8 @@ namespace
 		AddDrec(entries, 2, "many", 50, DT_DIR);
 	}
 
-	void AddGoodRecords(std::vector<KeyVal> &entries)
+	bool AddGoodRecords(std::vector<KeyVal> &entries,
+		std::vector<RfCarrierWrite> &writes, std::string &error)
 	{
 		AddBaseInodes(entries);
 
@@ -1063,11 +1387,20 @@ namespace
 		AddDrec(entries, 2, "too-big", 34, DT_REG);
 		AddInode(entries, FileInode(34, "too-big", 2000, 2000, APFS_UF_COMPRESSED, 0, 2000));
 		AddEmbeddedXattr(entries, 34, "com.apple.decmpfs", MakeDecmpfs(9, 2000, true));
+
+		// Valid resource-fork compressed content (inode 26 above stays the
+		// deliberate invalid-carrier negative case).
+		if (!AddRfContentRecords(entries, writes, error))
+			return false;
+
+		return AddInlineZlibRecords(entries, error);
 	}
 
-	void AddBadRecords(std::vector<KeyVal> &entries)
+	bool AddBadRecords(std::vector<KeyVal> &entries,
+		std::vector<RfCarrierWrite> &writes, std::string &error)
 	{
-		AddGoodRecords(entries);
+		if (!AddGoodRecords(entries, writes, error))
+			return false;
 
 		// High keys routed to the damaged last leaf.
 		AddDrec(entries, 2, "badfile", 9000, DT_REG);
@@ -1101,6 +1434,8 @@ namespace
 			std::snprintf(name, sizeof(name), "many-%05d", k);
 			AddDrec(entries, 50, name, 10000 + k, DT_REG);
 		}
+
+		return true;
 	}
 
 	void AddLargeRecords(std::vector<KeyVal> &entries)
@@ -1376,13 +1711,16 @@ bool CreateApfsFixture(const std::string &path, ApfsFixtureKind kind, std::strin
 	std::vector<KeyVal> entries;
 	std::vector<BlockRef> leaves;
 	std::vector<BlockRef> all_nodes;
+	std::vector<RfCarrierWrite> rf_writes;
 	switch (kind)
 	{
 	case ApfsFixtureKind::Good:
-		AddGoodRecords(entries);
+		if (!AddGoodRecords(entries, rf_writes, error))
+			return false;
 		break;
 	case ApfsFixtureKind::BadTree:
-		AddBadRecords(entries);
+		if (!AddBadRecords(entries, rf_writes, error))
+			return false;
 		break;
 	case ApfsFixtureKind::LargeDirectory:
 		AddLargeRecords(entries);
@@ -1403,6 +1741,19 @@ bool CreateApfsFixture(const std::string &path, ApfsFixtureKind kind, std::strin
 	WritePatternBlocks(image, DATA_9000, 1, 0);
 	WritePatternBlocks(image, DATA_XATTR_64K, 16, 0);
 	WritePatternBlocks(image, DATA_XATTR_64K1, 17, 0);
+
+	for (size_t k = 0; k < rf_writes.size(); k++)
+	{
+		const size_t blocks = (rf_writes[k].data.size() + BLOCK_SIZE - 1) / BLOCK_SIZE;
+		const size_t offset = static_cast<size_t>(rf_writes[k].paddr) * BLOCK_SIZE;
+		if (offset + blocks * BLOCK_SIZE > image.size())
+		{
+			error = "resource-fork dstream outside the image";
+			return false;
+		}
+		std::memcpy(image.data() + offset, rf_writes[k].data.data(),
+			rf_writes[k].data.size());
+	}
 
 	if (kind == ApfsFixtureKind::BadTree)
 	{
