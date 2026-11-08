@@ -3,22 +3,31 @@
 #include <cstdint>
 #include <vector>
 
-// Uncompressed content of the valid resource-fork compression fixtures.
-// The fixture builder and the tests both derive the expected bytes from here,
-// so the SHA-256 constants in RfContent.cpp are the independent golden anchor:
-// any accidental change to this generator makes the assertions fail.
+// Uncompressed content of the valid resource-fork and inline compression
+// fixtures. The fixture builder and the tests both derive the expected bytes
+// from here, so the SHA-256 constants in RfContent.cpp are the independent
+// golden anchor: any accidental change to this generator makes the assertions
+// fail.
 enum class RfContentKind : uint32_t
 {
 	ZlibSingle = 0,
 	ZlibMulti = 1,
 	LzvnSingle = 2,
-	LzvnMulti = 3
+	LzvnMulti = 3,
+	// Inline compression (algo 3) keeps the whole zlib stream in decmpfs.
+	// The text is deliberately low entropy so deflate emits a real Huffman
+	// block instead of a stored block, exercising the decoder path that the
+	// high-entropy resource-fork fixtures do not cover.
+	ZlibInline = 4,
+	ZlibInlineTruncated = 5,
+	ZlibInlineCorrupt = 6
 };
 
 constexpr uint64_t RF_BLOCK_SIZE = 0x10000;
 constexpr uint64_t RF_MULTI_TAIL = 12345;
 constexpr uint64_t RF_SINGLE_SIZE = RF_BLOCK_SIZE;
 constexpr uint64_t RF_MULTI_SIZE = 2 * RF_BLOCK_SIZE + RF_MULTI_TAIL;
+constexpr uint64_t RF_INLINE_SIZE = 16384;
 
 uint64_t RfContentSize(RfContentKind kind);
 

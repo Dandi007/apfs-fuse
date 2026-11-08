@@ -86,6 +86,10 @@ uint64_t RfContentSize(RfContentKind kind)
 	case RfContentKind::ZlibMulti:
 	case RfContentKind::LzvnMulti:
 		return RF_MULTI_SIZE;
+	case RfContentKind::ZlibInline:
+	case RfContentKind::ZlibInlineTruncated:
+	case RfContentKind::ZlibInlineCorrupt:
+		return RF_INLINE_SIZE;
 	}
 	return 0;
 }
@@ -123,6 +127,12 @@ const char *RfContentSha256Hex(RfContentKind kind)
 		return "9d818af1daa0ddaa4bcfc3644c3afddb9d1b96b485d3361f84b0be875295e852";
 	case RfContentKind::LzvnMulti:
 		return "39df88537b4c33765f79d63e1d6ce4f09b65cae0758667658da2169b94fde121";
+	case RfContentKind::ZlibInline:
+		return "8bb2b1c190c37e098a55be7bb5076a78e5b27712bea936fe5163fa5b70493918";
+	case RfContentKind::ZlibInlineTruncated:
+		return "66dd857302af73069306477d57296183d431425cd1e135d1ef0531c45553e6e0";
+	case RfContentKind::ZlibInlineCorrupt:
+		return "0f1c029a1dbefe3fdd0ebd39a9121a30b3f9bc8fe61a85154d628d04787712d4";
 	}
 	return "";
 }

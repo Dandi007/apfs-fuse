@@ -310,6 +310,17 @@ namespace
 		return data;
 	}
 
+	std::vector<uint8_t> MakeDecmpfsWithPayload(uint32_t algo, uint64_t size,
+		const std::vector<uint8_t> &payload)
+	{
+		std::vector<uint8_t> data(sizeof(CompressionHeader), 0);
+		WriteLE32(data, 0, DECMPFS_MAGIC);
+		WriteLE32(data, 4, algo);
+		WriteLE64(data, 8, size);
+		data.insert(data.end(), payload.begin(), payload.end());
+		return data;
+	}
+
 	bool RawNameLess(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen)
 	{
 		const size_t n = std::min(alen, blen);
@@ -1188,6 +1199,82 @@ namespace
 		return true;
 	}
 
+	// Inline compression (algo 3) stores the whole zlib stream after the
+	// decmpfs header. One fixture decompresses correctly; two keep a valid
+	// zlib header but are truncated or corrupted inside the deflate payload,
+	// so the reader must fail closed instead of hanging or returning partial
+	// bytes.
+	bool AddInlineZlibRecords(std::vector<KeyVal> &entries, std::string &error)
+	{
+		struct Case
+		{
+			uint64_t ino;
+			const char *name;
+			RfContentKind kind;
+		};
+
+		const Case cases[] = {
+			{64, "inline-zlib", RfContentKind::ZlibInline},
+			{65, "inline-zlib-truncated", RfContentKind::ZlibInlineTruncated},
+			{66, "inline-zlib-corrupt", RfContentKind::ZlibInlineCorrupt},
+		};
+
+		for (size_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++)
+		{
+			const Case &c = cases[k];
+			const std::string label = c.name;
+			const uint64_t size = RfContentSize(c.kind);
+
+			std::vector<uint8_t> content;
+			FillRfContent(content, c.kind);
+
+			std::string zerr;
+			std::vector<uint8_t> payload = ZlibCompressBlock(content.data(),
+				content.size(), zerr);
+			if (payload.empty())
+			{
+				error = label + ": " + zerr;
+				return false;
+			}
+
+			if (c.kind == RfContentKind::ZlibInlineTruncated)
+			{
+				if (payload.size() < 32)
+				{
+					error = label + ": compressed stream too short to truncate";
+					return false;
+				}
+				payload.resize(payload.size() - 16);
+			}
+			else if (c.kind == RfContentKind::ZlibInlineCorrupt)
+			{
+				if (payload.size() < 8)
+				{
+					error = label + ": compressed stream too short to corrupt";
+					return false;
+				}
+				// Keep the 0x78 zlib header so Decmpfs still dispatches to
+				// DecompressZLib, then set the first deflate block type to
+				// the reserved value 3, which inflate() rejects immediately.
+				payload[2] = (payload[2] & 0xF9) | 0x06;
+			}
+
+			if (sizeof(CompressionHeader) + payload.size() > XATTR_EMBEDDED_MAX)
+			{
+				error = label + ": inline zlib payload exceeds the embedded limit";
+				return false;
+			}
+
+			AddDrec(entries, 2, c.name, c.ino, DT_REG);
+			AddInode(entries, FileInode(c.ino, c.name, size, size,
+				APFS_UF_COMPRESSED, INODE_HAS_UNCOMPRESSED_SIZE, size));
+			AddEmbeddedXattr(entries, c.ino, "com.apple.decmpfs",
+				MakeDecmpfsWithPayload(3, size, payload));
+		}
+
+		return true;
+	}
+
 	void AddBaseInodes(std::vector<KeyVal> &entries)
 	{
 		InodeSpec root;
@@ -1303,7 +1390,10 @@ namespace
 
 		// Valid resource-fork compressed content (inode 26 above stays the
 		// deliberate invalid-carrier negative case).
-		return AddRfContentRecords(entries, writes, error);
+		if (!AddRfContentRecords(entries, writes, error))
+			return false;
+
+		return AddInlineZlibRecords(entries, error);
 	}
 
 	bool AddBadRecords(std::vector<KeyVal> &entries,

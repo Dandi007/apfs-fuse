@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -71,6 +72,22 @@ static void requireBytes(const std::vector<uint8_t> &actual,
 }
 
 static void TestResourceForkContent(ApfsDir &dir);
+static void TestInlineZlibContent(ApfsDir &dir, const std::string &image_path);
+
+// Captures std::cerr for one call so the test can assert the zlib failure
+// diagnostic without flooding the normal test output.
+class CerrCapture
+{
+public:
+	CerrCapture() : m_old(std::cerr.rdbuf(m_buffer.rdbuf())) {}
+	~CerrCapture() { std::cerr.rdbuf(m_old); }
+
+	std::string str() const { return m_buffer.str(); }
+
+private:
+	std::ostringstream m_buffer;
+	std::streambuf *m_old;
+};
 
 struct Image
 {
@@ -218,6 +235,7 @@ static void TestGoodImage(const std::string &path)
 		CompressionClass::InlineAttr, "unlimited decompression accepts the same inode");
 
 	TestResourceForkContent(dir);
+	TestInlineZlibContent(dir, path);
 }
 
 static void TestResourceForkContent(ApfsDir &dir)
@@ -321,6 +339,131 @@ static void TestResourceForkContent(ApfsDir &dir)
 		"inline file with user RF still classifies as inline");
 	require(!HidesResourceFork(CompressionClass::InlineAttr),
 		"inline compression does not hide the user resource fork");
+}
+
+static void TestInlineZlibContent(ApfsDir &dir, const std::string &image_path)
+{
+	struct Case
+	{
+		const char *name;
+		uint64_t ino;
+		RfContentKind kind;
+		bool damaged;
+	};
+
+	const Case cases[] = {
+		{"inline-zlib", 64, RfContentKind::ZlibInline, false},
+		{"inline-zlib-truncated", 65, RfContentKind::ZlibInlineTruncated, true},
+		{"inline-zlib-corrupt", 66, RfContentKind::ZlibInlineCorrupt, true},
+	};
+
+	ApfsDir::Inode rec;
+	IoStatus st = IoStatus::Ok;
+	uint64_t usize = 0;
+	uint64_t attr_size = 0;
+
+	for (size_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++)
+	{
+		const Case &c = cases[k];
+		const std::string label = c.name;
+		const uint64_t size = RfContentSize(c.kind);
+
+		require(dir.GetInode(rec, c.ino, &st) && st == IoStatus::Ok, label + ": inode");
+		require((rec.bsd_flags & APFS_UF_COMPRESSED) != 0, label + ": compressed flag");
+		require((rec.internal_flags & INODE_HAS_UNCOMPRESSED_SIZE) != 0,
+			label + ": uncompressed-size flag");
+		require(rec.uncompressed_size == size, label + ": inode size");
+		require(ClassifyInodeCompression(dir, rec, usize, attr_size) ==
+			CompressionClass::InlineAttr, label + ": class");
+		require(usize == size, label + ": classified size");
+
+		ApfsDir::XAttr info;
+		require(dir.GetAttributeInfo(info, c.ino, "com.apple.decmpfs", &st) &&
+			st == IoStatus::Ok && (info.flags & XATTR_DATA_EMBEDDED) != 0,
+			label + ": decmpfs stored embedded");
+
+		std::vector<uint8_t> decmpfs;
+		require(dir.GetAttribute(decmpfs, c.ino, "com.apple.decmpfs", &st) &&
+			st == IoStatus::Ok, label + ": decmpfs read");
+		DecmpfsHeader hdr = {};
+		require(ParseDecmpfsHeader(decmpfs.data(), decmpfs.size(), hdr),
+			label + ": decmpfs magic");
+		require(hdr.algo == 3, label + ": algorithm");
+		require(hdr.uncompressed_size == size, label + ": header size");
+		require(decmpfs.size() > sizeof(CompressionHeader) + 2,
+			label + ": zlib payload present");
+
+		const uint8_t *payload = decmpfs.data() + sizeof(CompressionHeader);
+		const size_t payload_size = decmpfs.size() - sizeof(CompressionHeader);
+		require(payload[0] == 0x78, label + ": zlib CMF");
+		require((((payload[0] << 8) | payload[1]) % 31) == 0,
+			label + ": zlib header checksum");
+
+		if (!c.damaged)
+		{
+			// The low-entropy text must exercise a real Huffman block. A
+			// stored block (type 0) would bypass that decoder path.
+			const unsigned btype = (payload[2] >> 1) & 3;
+			require(btype == 1 || btype == 2,
+				label + ": expected a Huffman block, not a stored block");
+
+			std::vector<uint8_t> decoded;
+			require(DecompressFile(dir, c.ino, decoded, decmpfs),
+				label + ": DecompressFile");
+
+			std::vector<uint8_t> expected;
+			FillRfContent(expected, c.kind);
+
+			requireBytes(decoded, expected, label + ": byte-for-byte content");
+			require(Sha256Hex(decoded) == RfContentSha256Hex(c.kind),
+				label + ": golden SHA-256");
+
+			std::cout << label << ": payload " << payload_size
+				<< " bytes, deflate BTYPE=" << btype << std::endl;
+		}
+		else
+		{
+			std::string log;
+			bool ok = true;
+			long long elapsed_us = 0;
+
+			{
+				CerrCapture capture;
+				const std::chrono::steady_clock::time_point start =
+					std::chrono::steady_clock::now();
+				std::vector<uint8_t> decoded;
+				ok = DecompressFile(dir, c.ino, decoded, decmpfs);
+				const std::chrono::steady_clock::time_point end =
+					std::chrono::steady_clock::now();
+				elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+					end - start).count();
+				log = capture.str();
+			}
+
+			require(!ok, label + ": damaged zlib must fail closed");
+			require(elapsed_us < 5LL * 1000 * 1000,
+				label + ": damaged zlib must return in bounded time");
+			require(log.find("APFS_ZLIB_ERROR") != std::string::npos,
+				label + ": missing APFS_ZLIB_ERROR diagnostic");
+
+			const char *const fields[] = {
+				"ret=", "total_in=", "total_out=", "src_size=", "dst_size="
+			};
+			for (size_t f = 0; f < sizeof(fields) / sizeof(fields[0]); f++)
+				require(log.find(fields[f]) != std::string::npos,
+					label + ": diagnostic missing " + fields[f]);
+
+			// The diagnostic must describe the stream, never the image path
+			// or the file name it came from.
+			require(log.find(image_path) == std::string::npos,
+				label + ": diagnostic leaks the image path");
+			require(log.find(c.name) == std::string::npos,
+				label + ": diagnostic leaks the file name");
+
+			std::cout << label << ": failed in " << elapsed_us
+				<< " us with bounded diagnostic" << std::endl;
+		}
+	}
 }
 
 static void TestBadImage(const std::string &path)
