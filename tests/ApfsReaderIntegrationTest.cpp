@@ -437,6 +437,38 @@ static void TestMissingAdlerDiagnostics(ApfsDir &dir, const std::string &image_p
 					"rf-zlib-multi: diagnostic block index");
 		}
 	}
+	{
+		std::vector<uint8_t> attr, decoded, expected;
+		require(dir.GetAttribute(attr, 91, "com.apple.decmpfs", &st), "canonical attr");
+		DecompressResult result;
+		CerrCapture capture;
+		require(DecompressFile(dir, 91, decoded, attr, &result), "canonical mixed decode");
+		FillRfContent(expected, RfContentKind::ZlibSingle);
+		auto tail = std::vector<uint8_t>(expected.begin(), expected.begin() + 12345);
+		expected.insert(expected.end(), tail.begin(), tail.end());
+		require(decoded == expected, "canonical mixed independent content");
+		require(result.zlib_block_count == 2 && result.missing_adler_block_count == 1,
+			"canonical mixed validation counts");
+		require(CountOccurrences(capture.str(), "APFS_DECMPFS_VALIDATION") == 2,
+			"canonical mixed log coverage");
+	}
+	{
+		std::vector<uint8_t> attr;
+		require(dir.GetAttribute(attr, 80, "com.apple.decmpfs", &st), "empty attr");
+		for (uint32_t algo : {3,4,7,8,9,10,11,12,13,14})
+		{
+			for (size_t j = 0; j < 4; ++j) attr[4+j] = (algo >> (8*j)) & 255;
+			std::vector<uint8_t> decoded(32, 0xAA);
+			DecompressResult result;
+			result.accepted_missing_adler = true;
+			result.zlib_block_count = result.missing_adler_block_count = 7;
+			require(DecompressFile(dir, 80, decoded, attr, &result), "empty supported algorithm");
+			require(decoded.empty() && !result.accepted_missing_adler &&
+				result.zlib_block_count == 0 && result.missing_adler_block_count == 0,
+				"empty output and metadata reset");
+		}
+	}
+
 }
 
 // Malformed carriers in the good image are real inode/xattr records. Every
@@ -464,7 +496,6 @@ static void TestRfBoundsRejects(ApfsDir &dir, const std::string &image_path)
 		{77, "rf-bad-raw-length", 4, "block", "raw_marker_length"},
 		{78, "rf-bad-data-offset", 4, "rsrc_table", "data_offset"},
 		{79, "rf-bad-huge-size", 4, "rsrc_table", "block_count"},
-		{80, "rf-bad-zero-size", 4, "header", "logical_size_zero"},
 		{81, "rf-bad-short-header", 4, "rsrc_table", "rsrc_header_short"},
 		{82, "rf-bad-empty-carrier", 4, "rsrc", nullptr},
 		{83, "rf-bad-off-table-short", 8, "rsrc_table", "table_short"},
@@ -475,6 +506,7 @@ static void TestRfBoundsRejects(ApfsDir &dir, const std::string &image_path)
 		{88, "rf-bad-raw10-length", 10, "block", "raw_marker_length"},
 		{89, "rf-bad-raw14-length", 14, "block", "raw_marker_length"},
 		{90, "rf-bad-partial-decode", 4, "block", "block_marker"},
+		{92, "rf-bad-map-block", 4, "rsrc_table", "block_size"},
 	};
 
 	IoStatus st = IoStatus::Ok;
@@ -489,7 +521,10 @@ static void TestRfBoundsRejects(ApfsDir &dir, const std::string &image_path)
 			st == IoStatus::Ok, label + ": decmpfs read");
 
 		DecompressResult result;
-		std::vector<uint8_t> decoded;
+		result.accepted_missing_adler = true;
+		result.zlib_block_count = 99;
+		result.missing_adler_block_count = 98;
+		std::vector<uint8_t> decoded(32, 0xAB);
 		std::string log;
 		bool ok = true;
 
@@ -500,6 +535,7 @@ static void TestRfBoundsRejects(ApfsDir &dir, const std::string &image_path)
 		}
 
 		require(!ok, label + ": malformed carrier must fail closed");
+		require(decoded.empty(), label + ": stale output retained");
 		require(result.zlib_block_count == 0 && result.missing_adler_block_count == 0 &&
 			!result.accepted_missing_adler, label + ": failure must not report success");
 		require(log.find("APFS_DECMPFS_ERROR") != std::string::npos,

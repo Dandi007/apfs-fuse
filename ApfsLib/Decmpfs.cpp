@@ -423,7 +423,7 @@ bool DecompressFile(ApfsDir &dir, uint64_t ino, std::vector<uint8_t> &decompress
 	};
 
 	if (logical_size == 0)
-		return fail("header", 0, "logical_size_zero");
+		return IsDecompAlgoSupported(algo) ? true : fail("header", 0, "unsupported_algo");
 
 #if 1 // Disable to get compressed data
 	if (g_debug & Dbg_Cmpfs)

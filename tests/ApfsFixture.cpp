@@ -1518,7 +1518,7 @@ namespace
 			const std::vector<uint8_t> data = MakeType4Data(0,
 				std::vector<std::pair<uint32_t, uint32_t> >(),
 				std::vector<uint8_t>(), 0, 8);
-			if (!AddRfRecord(entries, 80, "rf-bad-zero-size", 4,
+			if (!AddRfRecord(entries, 80, "rf-empty-size", 4,
 				0, MakeType4Carrier(0x100, data), error))
 				return false;
 		}
@@ -1610,6 +1610,36 @@ namespace
 			if (!AddRfRecord(entries, 90, "rf-bad-partial-decode", 4,
 				2 * RF_BLOCK_SIZE, MakeType4Carrier(0x100, data), error))
 				return false;
+		}
+
+		// Canonical resource layout: BE length prefix, bounded data section,
+		// followed by a distinct 50-byte map (not compressed payload).
+		{
+			std::vector<uint8_t> plain;
+			FillRfContent(plain, RfContentKind::ZlibSingle);
+			auto first = ZlibCompressBlock(plain.data(), plain.size(), error);
+			auto tail = ZlibCompressBlock(plain.data(), 12345, error);
+			if (first.empty() || tail.size() < 4) return false;
+			tail.resize(tail.size() - 4);
+			std::vector<uint8_t> payload = first;
+			payload.insert(payload.end(), tail.begin(), tail.end());
+			const uint32_t start = 24; // four bytes of padding after table
+			std::vector<std::pair<uint32_t, uint32_t>> table = {
+				{start, static_cast<uint32_t>(first.size())},
+				{start + static_cast<uint32_t>(first.size()), static_cast<uint32_t>(tail.size())}};
+			auto data = MakeType4Data(2, table, payload, start);
+			WriteBE32(data, 0, static_cast<uint32_t>(data.size() - 4));
+			auto carrier = MakeType4Carrier(0x100, data);
+			WriteBE32(carrier, 4, static_cast<uint32_t>(carrier.size()));
+			WriteBE32(carrier, 12, 50);
+			carrier.insert(carrier.end(), 50, 0xA5);
+			if (!AddRfRecord(entries, 91, "rf-canonical-mixed", 4,
+				RF_BLOCK_SIZE + 12345, carrier, error)) return false;
+			// Physically present map bytes must never satisfy a block range.
+			WriteLE32(carrier, 0x100 + 16, static_cast<uint32_t>(data.size() - 4));
+			WriteLE32(carrier, 0x100 + 20, 16);
+			if (!AddRfRecord(entries, 92, "rf-bad-map-block", 4,
+				RF_BLOCK_SIZE + 12345, carrier, error)) return false;
 		}
 
 		return true;

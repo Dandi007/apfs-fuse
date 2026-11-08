@@ -43,7 +43,7 @@ APFS_DECMPFS_ERROR ino=70 algo=4 block=0 stage=rsrc_table reason=block_count
 必须通过真实 `DecompressFile` 和合成 APFS 入口，不使用镜像解析器的纯 helper：
 
 - 正常：RF zlib/LZVN 单块、多块短尾、inline type 3 正常流保持逐字节和 SHA-256 不变；新增无 trailer 的 type 4 正例成功，`DecompressResult` 与诊断行正确。
-- 反例（全部断言 `false`、无成功诊断、无越界/零填充假成功）：少块、多块、短表、零长度块、offset/size 越界、倒序/重叠、表内指针、raw marker 长度错误、data_offset 越界、4 GiB 逻辑大小、零逻辑大小、短 header、空载体，以及 8/10/14 的短表/表内指针/零长度/越界/raw 长度错误。
+- 反例（全部断言 `false`、无成功诊断、无越界/零填充假成功）：少块、多块、短表、零长度块、offset/size 越界、倒序/重叠、表内指针、raw marker 长度错误、data_offset 越界、4 GiB 逻辑大小、短 header、空载体，以及 8/10/14 的短表/表内指针/零长度/越界/raw 长度错误。
 - 诊断：缺 Adler 正例与完整 checksum 对照；多块每个 `block` 索引可解析；错误行 `ino`/`algo`/`block`/`stage`/`reason` 准确，不含镜像路径或文件名。
 - Debug 与 Release 分别构建并运行 `ctest`（排除 FUSE 的 `reader-fuse` 与既有 `lookup-generation` skip）；另外用 ASan/UBSan 库层构建运行 `zlib-decompress` 与 `reader-integration`，已知基线对齐问题单独记录。
 - 不运行 FUSE，不访问真实源盘、块设备、生产挂载或服务。
@@ -61,3 +61,11 @@ APFS_DECMPFS_ERROR ino=70 algo=4 block=0 stage=rsrc_table reason=block_count
 - raw marker（0xFF/0x06/0xCC）块没有生产者 checksum，本 PR 只做 marker + 长度校验，不输出缺 checksum 诊断；其完整性语义仍弱于带 checksum 的 zlib。
 - zlib 缺 Adler 接受只覆盖已验证的 zlib 1.3.1 行为；不声明最低版本。
 - LZVN/LZFSE/LZBITMAP 解码器内部仍依赖上游实现的防御；本 PR 只保证调用前输入指针和长度已落在已验证的 rsrc 区间内。
+
+## 审查修正与发布前置
+
+零逻辑长度的受支持算法保持原兼容行为：返回空输出成功，结果metadata清零，不访问载体也不声称checksum已验证。这是非空块表验证的显式例外；未知算法仍拒绝。
+
+新增canonical type4布局：BE前缀等于data_size-4，完整压缩数据之后有独立50字节resource map；两块分别带/不带Adler，中间表后padding合法。对照反例把第二块指向物理上存在的map字节，必须拒绝。所有畸形载体测试预置非空输出及非零result，失败后清空。
+
+本PR的逐块日志还不是完整诊断协议。真实重放前须另PR增加对象汇总（blocks/zlib/raw/missing_adler/seq）并对接manifest：缺汇总对象为unknown，不能把没有缺Adler行等价为有checksum。日志必须由独立前台实例写入attempt专属0600文件，禁止daemon模式丢弃stderr。现有-d部分位会输出名字或字节，需确定不启用调试泄露的前台运行方式并在非root合成FUSE实测落盘，当前不能把这一前置称为通过。生产reader不变。
