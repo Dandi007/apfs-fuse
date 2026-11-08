@@ -489,12 +489,18 @@ size_t DecompressZLib(uint8_t *dst, size_t dst_size, const uint8_t *src, size_t 
 
 	const size_t decoded = dst_size - strm.avail_out;
 
+	if (!complete)
+		std::cerr << "APFS_ZLIB_ERROR ret=" << ret
+			<< " msg=" << (strm.msg ? strm.msg : "none")
+			<< " total_in=" << strm.total_in << " total_out=" << strm.total_out
+			<< " src_size=" << src_size << " dst_size=" << dst_size << std::endl;
+
 	inflateEnd(&strm);
 
 	// Never report a plausible length for a truncated or damaged stream.
 	// Callers compare the result against the expected chunk length, so a
 	// non-zero partial count would let bad data through; zero always
-	// fails that comparison for real compressed content.
+	// fails that comparison when the expected output length is non-zero.
 	if (!complete)
 		return 0;
 

@@ -42,7 +42,7 @@
 - `Decmpfs.cpp` attr 路径（algo 3）：`decoded_bytes != hdr->size` → `DecompressFile` 返回 false。
 - `Decmpfs.cpp` resource-fork 路径（algo 4）：每个 64 KiB entry 的 `decoded_bytes != expected_len` → false。
 
-部分产出长度或 `dst_size` 都可能与期望长度相等，只有 0 对真实压缩内容（期望长度 > 0）稳定失败。空文件/零长度期望不属于 APFS 压缩文件的实际路径，见 §6 剩余风险。
+部分产出长度或 `dst_size` 都可能与期望长度相等，只有 0 对真实压缩内容（期望长度 > 0）稳定失败。压缩期望长度始终大于零只是未验证的格式假设；当前代码未拒绝 hdr->size==0，坏流在该边界仍可能被接受为空文件，见 §6。
 
 ### 3.3 size_t → uInt
 
@@ -56,7 +56,7 @@ zlib 的 `avail_in`/`avail_out` 是 `uInt`。旧代码直接把 `size_t` 赋给�
 
 `apfs_open` 在 `DecompressFile` 返回 false 且 `g_lax == false`（默认）时 `fuse_reply_err(req, EIO)`；`g_lax` 仅由 `-l` 打开。本 PR 不改该逻辑，只让 `DecompressZLib` 不再把失败伪装成完整块。
 
-`DeviceDMG.cpp` 也调用 `DecompressZLib`，但忽略返回值；本 PR 不修改该路径。其行为变化仅是坏流不再空转、返回 0（调用方仍忽略），见 §6。
+`DeviceDMG.cpp` 也调用 `DecompressZLib`，但忽略返回值；本 PR 不修改该路径。其行为变化包括截断流从原来挂住变为快速返回，但调用方仍可能静默使用不完整数据，见 §6。
 
 ## 4. 测试
 
@@ -108,8 +108,8 @@ zlib 的 `avail_in`/`avail_out` 是 `uInt`。旧代码直接把 `size_t` 赋给�
 ## 6. 剩余风险（供 review）
 
 - **未覆盖真实压缩字节**：现场 path、压缩块和损坏原因均未知。本修复保证“坏流不再卡住、不再假成功”，但不能证明现场 7 分钟卡顿就由该缺陷单独造成；需在隔离、只读、非 root、限速条件下用同一 reader 版本重放真实 111 键并观察 `ioerr`/trace。
-- **`dst_size == 0` 的 0 返回值有歧义**：成功空流与失败都返回 0。APFS 压缩文件的实际期望长度 > 0，现有调用点不会接受 0 作为完整块；若未来新增零长度压缩语义，应改成显式 bool/out 参数。
-- **`DeviceDMG.cpp` 忽略返回值**：坏 DMG 流现在会快速返回 0，但调用方仍不看返回值。是否应改为失败传播超出本 PR 范围，未测试。
+- **`dst_size == 0` 的 0 返回值有歧义**：成功空流与失败都返回 0。代码未拒绝 hdr->size==0，因此坏流在该边界可能被接受为空文件。期望长度始终大于零是未验证的格式假设。这是基线缺口，本 PR 未解决；如需修改该语义，应另行审查显式状态返回及调用方。
+- **`DeviceDMG.cpp` 忽略返回值**：截断的 DMG 块过去会挂住，现在快速返回后调用方仍可能静默使用不完整数据。是否应改为失败传播超出本 PR 范围，未测试。
 - **大 `hdr->size` 的分配仍发生在 `DecompressZLib` 之前**：`DecompressFile` 先 `resize(hdr->size)`；`size_t > UINT_MAX` 的守卫只能阻止错误解压，不能阻止这次分配。`apfs_open` 的 `g_max_decomp_size` 默认 0（不限），异常头仍可能触发大分配；`bad_alloc`/`length_error` 已被捕获为 EIO。
 - **未跑 FUSE 挂载、未跑真实 APFS 镜像**：`apfs_open` 的 EIO 只做了代码核对；没有挂载级回归。
 - **没有性能基准**：修复消除了空转，但正常大文件的解压成本不变。
@@ -122,3 +122,9 @@ zlib 的 `avail_in`/`avail_out` 是 `uInt`。旧代码直接把 `size_t` 赋给�
 - 真实重放只能在隔离、只读、非 root、限速的 reader 进程中进行，并保留 H-R 健康窗口/`ioerr` 证据；本 PR 不授权自动重跑真实源。
 - 回滚：保留旧 binary；若新 reader 在真实数据上把原本“能读出”的文件变成 EIO，应先取证再决定是否回滚。fail-closed 意味着损坏数据现在会明确失败，这是预期行为，不是回归。
 - 不声称 production ready：未覆盖真实压缩字节、未做 FUSE 端到端、未覆盖 DMG 路径。
+
+## 8. 独立审查处置
+
+Opus确认核心修复可合入。真实重放前P2已补：失败分支在inflateEnd之前输出APFS_ZLIB_ERROR，包含ret/msg/total_in/total_out/src_size/dst_size，不输出压缩内容或文件名，不改返回值。函数不接收inode，现场关联必须由manifest在open之前持久记录path_b64和file_id，不能称此日志本身包含inode。case10也加入2秒超时保护。零长度/DMG风险按基线缺口明确保留。
+
+真实重放仍需：PR4正常RF fixture放到新实现上、正常inline zlib、损坏或截断流的FUSE有界EIO及诊断；同一新reader重建独立M0并重签计划；manifest当前对象与单文件超时独立PR。未扩大class6预期集合，不自动重跑源盘。

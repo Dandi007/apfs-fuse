@@ -303,9 +303,12 @@ int main()
 		std::vector<uint8_t> out(16, 0);
 		const size_t too_big = static_cast<size_t>(UINT_MAX) + 1;
 
-		require(DecompressZLib(out.data(), out.size(), small.data(), too_big) == 0,
+		size_t result = 1;
+		require(run_with_timeout(2, [&]() { return DecompressZLib(out.data(), out.size(), small.data(), too_big); }, result), "oversized input timed out");
+		require(result == 0,
 			"oversized input size was truncated instead of rejected");
-		require(DecompressZLib(out.data(), too_big, small.data(), small.size()) == 0,
+		require(run_with_timeout(2, [&]() { return DecompressZLib(out.data(), too_big, small.data(), small.size()); }, result), "oversized output timed out");
+		require(result == 0,
 			"oversized output size was truncated instead of rejected");
 	}
 
