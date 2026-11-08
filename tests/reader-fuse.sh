@@ -45,8 +45,7 @@ if [ -z "${MKAPFS:-}" ]; then
 fi
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/apfs-fuse-t2-XXXXXX") || exit 1
-MNT=$WORK/mnt
-mkdir -p "$MNT"
+MNT=$(mktemp -d "${APFS_FUSE_MOUNT_ROOT:-$WORK}/apfs-mnt-XXXXXX") || exit 1
 
 cleanup() {
 	if command -v fusermount3 >/dev/null 2>&1; then
@@ -54,7 +53,16 @@ cleanup() {
 	else
 		fusermount -u "$MNT" 2>/dev/null || true
 	fi
-	umount -l "$MNT" 2>/dev/null || sudo -n umount -l "$MNT" 2>/dev/null || true
+	if [ "${APFS_FUSE_USE_SUDO:-auto}" = "0" ]; then
+		umount -l "$MNT" 2>/dev/null || true
+	else
+		umount -l "$MNT" 2>/dev/null || sudo -n umount -l "$MNT" 2>/dev/null || true
+	fi
+	if mountpoint -q "$MNT"; then
+		echo "FAIL: fixture mount remains; preserving $WORK" >&2
+		return 1
+	fi
+	rmdir "$MNT"
 	rm -rf "$WORK"
 }
 trap cleanup EXIT INT TERM
@@ -70,11 +78,11 @@ FUSERMOUNT=$(command -v fusermount3 || command -v fusermount)
 # validating as a regular user on a host where fusermount3 is permitted).
 if [ "${APFS_FUSE_USE_SUDO:-auto}" = "0" ]; then
 	APFS_FUSE_USE_SUDO=0 python3 -I \
-		"$(dirname "$0")/reader_fuse_test.py" "$BIN" "$WORK" "$FUSERMOUNT"
+		"$(dirname "$0")/reader_fuse_test.py" "$BIN" "$WORK" "$FUSERMOUNT" "$MNT"
 elif [ "$(id -u)" -ne 0 ] && sudo -n true >/dev/null 2>&1; then
 	sudo -n env APFS_FUSE_USE_SUDO=1 python3 -I \
-		"$(dirname "$0")/reader_fuse_test.py" "$BIN" "$WORK" "$FUSERMOUNT"
+		"$(dirname "$0")/reader_fuse_test.py" "$BIN" "$WORK" "$FUSERMOUNT" "$MNT"
 else
 	APFS_FUSE_USE_SUDO=0 python3 -I \
-		"$(dirname "$0")/reader_fuse_test.py" "$BIN" "$WORK" "$FUSERMOUNT"
+		"$(dirname "$0")/reader_fuse_test.py" "$BIN" "$WORK" "$FUSERMOUNT" "$MNT"
 fi

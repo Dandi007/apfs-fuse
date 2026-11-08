@@ -138,3 +138,7 @@ APFS_FUSE_USE_SUDO=0 sh tests/reader-fuse.sh \
 - owner 提供的已合入 reader 二进制与 `-F` 冒烟证据（同一路径重复 open、stdout 0、
   `rf-missing` 无 ERROR）只作为参考，不替代本 PR 的双路径库层断言和正式
   raid-backup 单元。
+
+## 本机挂载点与清理
+
+镜像和输出可放 `TMPDIR=/data/tmp/...`，以 `APFS_FUSE_MOUNT_ROOT=/tmp` 单独指定挂载点父目录，避免 tmpfs 配额耗尽及 AppArmor 对 /data 挂载的限制。`APFS_FUSE_USE_SUDO=0` 同时禁止清理阶段 sudo；卸载仍未完成时保留现场并报错，不递归删除挂载路径。

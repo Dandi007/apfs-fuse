@@ -12,7 +12,7 @@ import time
 BIN = sys.argv[1]
 WORK = sys.argv[2]
 FUSERMOUNT = sys.argv[3]
-MNT = os.path.join(WORK, "mnt")
+MNT = sys.argv[4] if len(sys.argv) > 4 else os.path.join(WORK, "mnt")
 
 USE_SUDO = os.environ.get("APFS_FUSE_USE_SUDO") == "1"
 PREFIX = ["sudo", "-n"] if USE_SUDO else []
