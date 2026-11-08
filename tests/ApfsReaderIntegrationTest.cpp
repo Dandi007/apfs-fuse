@@ -828,6 +828,43 @@ static void TestObjectDiagnostics(ApfsDir &dir, const std::string &image_path)
 {
 	IoStatus st = IoStatus::Ok;
 
+	// A failed/short diagnostic write must fail the object, and must not
+	// poison later attempts after the sink is restored.
+	for (int short_write = 0; short_write < 2; ++short_write)
+	{
+		class FailingBuffer : public std::streambuf {
+		public:
+			explicit FailingBuffer(bool short_write) : partial(short_write) {}
+			std::streamsize xsputn(const char *, std::streamsize n) override
+			{ return partial && n > 0 ? n - 1 : 0; }
+			int_type overflow(int_type) override { return traits_type::eof(); }
+		private:
+			bool partial;
+		} failing(short_write != 0);
+		std::vector<uint8_t> attr, decoded(32, 0xAB);
+		require(dir.GetAttribute(attr, 60, "com.apple.decmpfs", &st), "diagnostic failure attr");
+		DecompressResult result = DirtyResult();
+		auto *old = std::cerr.rdbuf(&failing);
+		const bool ok = DecompressFile(dir, 60, decoded, attr, &result);
+		// Deliberately preserve the failed stream state when restoring sink.
+		const auto state = std::cerr.rdstate();
+		std::cerr.rdbuf(old);
+		std::cerr.setstate(state);
+		require(!ok && decoded.empty() && result.seq == 0 && result.block_count == 0,
+			"failed diagnostic write accepted object");
+		std::ostringstream recovered;
+		old = std::cerr.rdbuf(recovered.rdbuf());
+		std::cerr.setstate(state);
+		const bool recovered_ok = DecompressFile(dir, 60, decoded, attr, &result);
+		std::cerr.rdbuf(old);
+		require(recovered_ok && !decoded.empty(), "diagnostic sink did not recover");
+		CheckObjectSummary(recovered.str(), result, "recovered diagnostic");
+		const auto object = recovered.str().find("APFS_DECMPFS_OBJECT");
+		require(object != std::string::npos &&
+			recovered.str().find('\n', object) == recovered.str().size() - 1,
+			"OBJECT must be last complete line");
+	}
+
 	struct Case
 	{
 		uint64_t ino;

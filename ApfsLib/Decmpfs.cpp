@@ -77,14 +77,18 @@ std::mutex &DiagnosticMutex()
 // Diagnostics are built completely before one write so a line cannot be
 // interleaved with another thread's output. Only stable identity and sizes
 // are printed: never a file name, path or payload byte.
-void EmitBlob(const std::string &blob)
+bool EmitBlob(const std::string &blob)
 {
 	if (blob.empty())
-		return;
+		return true;
 
 	std::lock_guard<std::mutex> lock(DiagnosticMutex());
+	std::cerr.clear();
 	std::cerr.write(blob.data(), static_cast<std::streamsize>(blob.size()));
 	std::cerr.flush();
+	const bool ok = std::cerr.good();
+	std::cerr.clear();
+	return ok;
 }
 
 void EmitError(uint64_t seq, uint64_t ino, uint32_t algo, size_t block,
@@ -489,7 +493,8 @@ bool DecompressFile(ApfsDir &dir, uint64_t ino, std::vector<uint8_t> &decompress
 			return fail("allocate", 0, "diagnostic");
 		}
 
-		EmitBlob(blob);
+		if (!EmitBlob(blob))
+			return fail("diagnostic", 0, "write");
 		if (result)
 		{
 			result->seq = seq;

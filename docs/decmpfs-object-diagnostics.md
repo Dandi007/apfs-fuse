@@ -143,3 +143,9 @@ APFS_DECMPFS_ERROR seq=8 ino=90 algo=4 block=1 stage=block reason=block_marker
 - LZVN/LZFSE/LZBITMAP 解码器内部仍依赖上游实现；本 PR 只保证输入范围已经过
   表校验，并按块来源计数。
 - zlib 缺 Adler 接受依赖已验证的 zlib 1.3.1 行为；本 PR 不声明最低版本。
+
+## stderr发布失败合同
+
+EmitBlob在互斥区内清除此前流错误、write及flush、检查good并清除流状态。写失败（含短写）返回false，finish转diagnostic/write错误并清空output/result，不把这次内容发布为成功。错误行自身可能因同一故障丢失，因此manifest仍必须将缺summary/截断/冲突记unknown，不能以无ERROR作为成功。恢复sink后后续对象允许正常写出。测试注入拒写及短写streambuf，保留badbit换回正常sink后验证恢复和OBJECT末行。
+
+Owner set-e新构建：Debug/Release各6PASS1既有lookup-generation skip；ASan/UBSan库层zlib-decompress与reader-integration 2PASS（既有对齐问题范围沿用前审，非全无UB声明）。未运行FUSE或真实源。
