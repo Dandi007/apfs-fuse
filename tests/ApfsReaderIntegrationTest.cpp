@@ -75,6 +75,9 @@ static void requireBytes(const std::vector<uint8_t> &actual,
 
 static void TestResourceForkContent(ApfsDir &dir);
 static void TestHardLinkAliases(ApfsDir &dir);
+static void TestGoodNoLinkImage(const std::string &good_path,
+	const std::string &nolink_path);
+static void TestBadLayoutUnchanged(const std::string &bad_path);
 static void TestMissingAdlerDiagnostics(ApfsDir &dir, const std::string &image_path);
 static void TestRfBoundsRejects(ApfsDir &dir, const std::string &image_path);
 static void TestInlineZlibContent(ApfsDir &dir, const std::string &image_path);
@@ -370,6 +373,232 @@ static void TestHardLinkAliases(ApfsDir &dir)
 	ApfsDir::Inode rec;
 	require(dir.GetInode(rec, 60, &st) && st == IoStatus::Ok, "hardlink inode");
 	require(rec.nchildren_nlink == 2, "hardlink inode nlink");
+}
+
+struct RootEntry
+{
+	std::string name;
+	uint64_t file_id;
+	uint16_t flags;
+};
+
+static std::vector<RootEntry> ListRootEntries(ApfsDir &dir, const std::string &label)
+{
+	std::vector<ApfsDir::DirRec> recs;
+	IoStatus st = IoStatus::Ok;
+	require(dir.ListDirectory(recs, 2, &st) && st == IoStatus::Ok, label + ": list root");
+
+	std::vector<RootEntry> entries(recs.size());
+	for (size_t k = 0; k < recs.size(); k++)
+	{
+		entries[k].name = recs[k].name;
+		entries[k].file_id = recs[k].file_id;
+		entries[k].flags = recs[k].flags;
+	}
+	std::sort(entries.begin(), entries.end(),
+		[](const RootEntry &a, const RootEntry &b) { return a.name < b.name; });
+	return entries;
+}
+
+// Reads every attribute and the raw extent bytes of one object. Both images
+// are generated from the same records, so any difference here means the new
+// fixture mode changed an object that must stay identical.
+static void RequireSameObject(ApfsDir &a, ApfsDir &b, uint64_t ino,
+	const std::string &label)
+{
+	ApfsDir::Inode ia;
+	ApfsDir::Inode ib;
+	IoStatus sa = IoStatus::Ok;
+	IoStatus sb = IoStatus::Ok;
+	const bool inode_a = a.GetInode(ia, ino, &sa);
+	const bool inode_b = b.GetInode(ib, ino, &sb);
+	require(inode_a == inode_b && sa == sb, label + ": inode status differs");
+	if (!inode_a)
+		return;
+	require(sa == IoStatus::Ok, label + ": inode unavailable");
+
+	// nchildren_nlink is compared by the hardlink tests instead: it is the
+	// only inode field the two modes intentionally differ on.
+	require(ia.obj_id == ib.obj_id && ia.parent_id == ib.parent_id &&
+		ia.private_id == ib.private_id && ia.mode == ib.mode &&
+		ia.internal_flags == ib.internal_flags && ia.bsd_flags == ib.bsd_flags &&
+		ia.owner == ib.owner && ia.group == ib.group &&
+		ia.uncompressed_size == ib.uncompressed_size &&
+		ia.ds_size == ib.ds_size && ia.ds_alloced_size == ib.ds_alloced_size &&
+		ia.sparse_bytes == ib.sparse_bytes && ia.name == ib.name,
+		label + ": inode metadata differs");
+
+	std::vector<std::string> attrs_a;
+	std::vector<std::string> attrs_b;
+	IoStatus xa = IoStatus::Ok;
+	IoStatus xb = IoStatus::Ok;
+	const bool list_a = a.ListAttributes(attrs_a, ino, &xa);
+	const bool list_b = b.ListAttributes(attrs_b, ino, &xb);
+	require(list_a == list_b && xa == xb, label + ": attribute list status differs");
+	if (!list_a)
+		return;
+
+	std::sort(attrs_a.begin(), attrs_a.end());
+	std::sort(attrs_b.begin(), attrs_b.end());
+	require(attrs_a == attrs_b, label + ": attribute names differ");
+
+	for (size_t k = 0; k < attrs_a.size(); k++)
+	{
+		const std::string what = label + ": attribute " + attrs_a[k];
+		ApfsDir::XAttr info_a;
+		ApfsDir::XAttr info_b;
+		require(a.GetAttributeInfo(info_a, ino, attrs_a[k].c_str(), &sa) &&
+			sa == IoStatus::Ok &&
+			b.GetAttributeInfo(info_b, ino, attrs_a[k].c_str(), &sb) &&
+			sb == IoStatus::Ok, what + " info");
+		require(info_a.flags == info_b.flags &&
+			info_a.xdata_len == info_b.xdata_len &&
+			info_a.xstrm.dstream.size == info_b.xstrm.dstream.size &&
+			info_a.xstrm.dstream.alloced_size ==
+				info_b.xstrm.dstream.alloced_size,
+			what + " metadata");
+
+		std::vector<uint8_t> data_a;
+		std::vector<uint8_t> data_b;
+		require(a.GetAttribute(data_a, ino, attrs_a[k].c_str(), &sa) &&
+			sa == IoStatus::Ok &&
+			b.GetAttribute(data_b, ino, attrs_a[k].c_str(), &sb) &&
+			sb == IoStatus::Ok, what + " read");
+		requireBytes(data_a, data_b, what);
+	}
+
+	if ((ia.mode & MODE_S_IFMT) == MODE_S_IFREG && ia.ds_size != 0)
+	{
+		std::vector<uint8_t> data_a(static_cast<size_t>(ia.ds_size), 0xAA);
+		std::vector<uint8_t> data_b(static_cast<size_t>(ib.ds_size), 0xBB);
+		IoStatus ra = IoStatus::Ok;
+		IoStatus rb = IoStatus::Ok;
+		const bool read_a = a.ReadFile(data_a.data(), ino, 0, data_a.size(),
+			&ra, ia.ds_size);
+		const bool read_b = b.ReadFile(data_b.data(), ino, 0, data_b.size(),
+			&rb, ib.ds_size);
+		require(read_a == read_b && ra == rb, label + ": file read status differs");
+		if (read_a)
+			requireBytes(data_a, data_b, label + ": file data");
+	}
+}
+
+// good-nolink is the good image with a single directory name for inode 60.
+// Everything else must be readable and byte-identical to the good image.
+static void TestGoodNoLinkImage(const std::string &good_path,
+	const std::string &nolink_path)
+{
+	Image good_image;
+	Image nolink_image;
+	std::string error;
+	require(OpenImage(good_path, good_image, error), "open good image: " + error);
+	require(OpenImage(nolink_path, nolink_image, error),
+		"open good-nolink image: " + error);
+	ApfsDir &good = *good_image.dir;
+	ApfsDir &nolink = *nolink_image.dir;
+
+	IoStatus st = IoStatus::Ok;
+	ApfsDir::DirRec rec;
+	ApfsDir::Inode inode;
+
+	require(nolink.LookupName(rec, 2, "rf-zlib-1blk", &st) &&
+		st == IoStatus::Ok && rec.file_id == 60,
+		"good-nolink primary name must resolve to ino 60");
+	require(!nolink.LookupName(rec, 2, "rf-zlib-1blk-hardlink", &st) &&
+		st == IoStatus::NotFound,
+		"good-nolink must not expose the hardlink alias");
+	require(nolink.GetInode(inode, 60, &st) && st == IoStatus::Ok &&
+		inode.nchildren_nlink == 1, "good-nolink inode 60 nlink");
+
+	// The original good image keeps both names and nlink 2.
+	require(good.LookupName(rec, 2, "rf-zlib-1blk-hardlink", &st) &&
+		st == IoStatus::Ok && rec.file_id == 60,
+		"good must keep the hardlink alias");
+	require(good.GetInode(inode, 60, &st) && st == IoStatus::Ok &&
+		inode.nchildren_nlink == 2, "good inode 60 nlink");
+
+	const std::vector<RootEntry> good_entries = ListRootEntries(good, "good");
+	const std::vector<RootEntry> nolink_entries =
+		ListRootEntries(nolink, "good-nolink");
+	require(good_entries.size() == nolink_entries.size() + 1,
+		"good root must differ from good-nolink by exactly one entry");
+
+	size_t gi = 0;
+	for (size_t ni = 0; ni < nolink_entries.size(); ni++)
+	{
+		while (gi < good_entries.size() &&
+			good_entries[gi].name == "rf-zlib-1blk-hardlink")
+			gi++;
+		require(gi < good_entries.size() &&
+			good_entries[gi].name == nolink_entries[ni].name,
+			"root entry sets differ at " + nolink_entries[ni].name);
+		require(good_entries[gi].file_id == nolink_entries[ni].file_id &&
+			good_entries[gi].flags == nolink_entries[ni].flags,
+			"root entry changed: " + nolink_entries[ni].name);
+		gi++;
+	}
+	while (gi < good_entries.size() &&
+		good_entries[gi].name == "rf-zlib-1blk-hardlink")
+		gi++;
+	require(gi == good_entries.size(), "good has unexpected extra root entries");
+
+	for (size_t k = 0; k < nolink_entries.size(); k++)
+		RequireSameObject(good, nolink, nolink_entries[k].file_id,
+			"root entry " + nolink_entries[k].name);
+}
+
+// Pins the bad-tree root layout: the new mode must not add the hardlink alias
+// or change any other root record.
+static void TestBadLayoutUnchanged(const std::string &bad_path)
+{
+	Image image;
+	std::string error;
+	require(OpenImage(bad_path, image, error), "open bad image: " + error);
+	ApfsDir &dir = *image.dir;
+
+	IoStatus st = IoStatus::Ok;
+	ApfsDir::DirRec rec;
+	require(!dir.LookupName(rec, 2, "rf-zlib-1blk-hardlink", &st) &&
+		st == IoStatus::NotFound, "bad image must not gain the hardlink alias");
+
+	const char *const expected[] = {
+		"CaseName.txt",
+		"bad-device.bin",
+		"badattrs",
+		"baddir",
+		"badfile",
+		"e\xCC\x81.txt",
+		"gap.bin",
+		"hole.bin",
+		"inline",
+		"inline-empty",
+		"inline-user-rf",
+		"inline-zlib",
+		"inline-zlib-corrupt",
+		"inline-zlib-truncated",
+		"many",
+		"rf",
+		"rf-lzvn-1blk",
+		"rf-lzvn-multi",
+		"rf-missing",
+		"rf-zlib-1blk",
+		"rf-zlib-multi",
+		"rf-zlib-no-adler",
+		"size-mismatch",
+		"too-big",
+		"unicode-\xF0\x9F\xA7\xA8",
+		"unknown-algo",
+		"user-rf",
+		"xattrs"
+	};
+	const size_t expected_count = sizeof(expected) / sizeof(expected[0]);
+
+	const std::vector<RootEntry> entries = ListRootEntries(dir, "bad");
+	require(entries.size() == expected_count, "bad root entry count changed");
+	for (size_t k = 0; k < expected_count; k++)
+		require(entries[k].name == expected[k],
+			"bad root entry changed: " + std::string(expected[k]) +
+			" != " + entries[k].name);
 }
 
 static void TestResourceForkContent(ApfsDir &dir)
@@ -1371,11 +1600,13 @@ int main()
 	}
 
 	const std::string good = std::string(dir) + "/good.img";
+	const std::string good_nolink = std::string(dir) + "/good-nolink.img";
 	const std::string bad = std::string(dir) + "/bad.img";
 	const std::string large = std::string(dir) + "/large.img";
 	std::string error;
 
 	if (!CreateApfsFixture(good, ApfsFixtureKind::Good, error) ||
+		!CreateApfsFixture(good_nolink, ApfsFixtureKind::GoodNoLink, error) ||
 		!CreateApfsFixture(bad, ApfsFixtureKind::BadTree, error) ||
 		!CreateApfsFixture(large, ApfsFixtureKind::LargeDirectory, error))
 	{
@@ -1384,10 +1615,13 @@ int main()
 	}
 
 	TestGoodImage(good);
+	TestGoodNoLinkImage(good, good_nolink);
 	TestBadImage(bad);
+	TestBadLayoutUnchanged(bad);
 	TestLargeDirectory(large);
 
 	std::remove(good.c_str());
+	std::remove(good_nolink.c_str());
 	std::remove(bad.c_str());
 	std::remove(large.c_str());
 	rmdir(dir);
