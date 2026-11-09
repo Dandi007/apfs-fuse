@@ -5,6 +5,8 @@
 enum class ApfsFixtureKind
 {
 	Good,
+	// Same content as Good, but inode 60 keeps a single directory name.
+	GoodNoLink,
 	BadTree,
 	LargeDirectory
 };

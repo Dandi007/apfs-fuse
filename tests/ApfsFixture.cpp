@@ -2133,12 +2133,14 @@ bool CreateApfsFixture(const std::string &path, ApfsFixtureKind kind, std::strin
 	switch (kind)
 	{
 	case ApfsFixtureKind::Good:
-		// The hardlink alias is only needed in the good image. Adding it to
-		// the bad tree would shift the leaf groups that test deliberately
-		// corrupts.
-		if (!AddGoodRecords(entries, rf_writes, true, error))
+	case ApfsFixtureKind::GoodNoLink:
+		// Both good images share every record; only the hardlink alias on
+		// inode 60 differs. The bad tree never gets the alias because adding
+		// it would shift the leaf groups that test deliberately corrupts.
+		if (!AddGoodRecords(entries, rf_writes,
+			kind == ApfsFixtureKind::Good, error))
 			return false;
-		// Malformed-carrier cases live only in the good image so they do not
+		// Malformed-carrier cases live only in the good images so they do not
 		// shift the high keys that the BadTree image deliberately corrupts.
 		if (!AddRfBoundsRecords(entries, error))
 			return false;
